@@ -29,7 +29,8 @@ enum RugTextureGenerator {
         static let ink = CGColor(srgbRed: 0.09, green: 0.07, blue: 0.09, alpha: 1)
     }
 
-    static func makeRugImage(width W: Int = 2048, height H: Int = 1412, seed: UInt64 = 7) -> CGImage {
+    static func makeRugImage(style: RugStyle = .tabriz, width W: Int = 2048, height H: Int = 1412) -> CGImage {
+        let pal = style.palette
         let cs = CGColorSpace(name: CGColorSpace.sRGB)!
         let ctx = CGContext(
             data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0,
@@ -37,17 +38,17 @@ enum RugTextureGenerator {
         )!
         ctx.setAllowsAntialiasing(true)
         ctx.setShouldAntialias(true)
-        var rng = SplitMix64(seed: seed)
+        var rng = SplitMix64(seed: style.seed)
         let w = CGFloat(W), h = CGFloat(H)
 
         // --- Field with abrash (dye-lot banding) ---
-        ctx.setFillColor(Palette.red)
+        ctx.setFillColor(pal.red)
         ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
         var y: CGFloat = 0
         while y < h {
             let bh = rng.range(14, 36)
             let t = rng.range(-0.045, 0.045)
-            ctx.setFillColor(CGColor(srgbRed: 0.56 + t, green: 0.12 + t * 0.4, blue: 0.14 + t * 0.4, alpha: 1))
+            ctx.setFillColor(shade(pal.red, by: t))
             ctx.fill(CGRect(x: 0, y: y, width: w, height: bh + 1))
             y += bh
         }
@@ -60,20 +61,20 @@ enum RugTextureGenerator {
         let fieldInset = outerGuard + mainBorder + innerGuard + outline
 
         drawBand(ctx, inset: 0, thickness: outerGuard, size: CGSize(width: w, height: h)) { c, len, t in
-            c.setFillColor(Palette.navy); c.fill(CGRect(x: 0, y: 0, width: len, height: t))
+            c.setFillColor(pal.navy); c.fill(CGRect(x: 0, y: 0, width: len, height: t))
             // reciprocal cream/gold tooth pattern
             let step: CGFloat = 36
             var x: CGFloat = 0; var k = 0
             while x < len {
-                c.setFillColor(k % 2 == 0 ? Palette.cream : Palette.gold)
+                c.setFillColor(k % 2 == 0 ? pal.cream : pal.gold)
                 c.fill(CGRect(x: x + 8, y: 12, width: 16, height: t - 24))
                 x += step; k += 1
             }
         }
         drawBand(ctx, inset: outerGuard, thickness: mainBorder, size: CGSize(width: w, height: h)) { c, len, t in
-            c.setFillColor(Palette.deepNavy); c.fill(CGRect(x: 0, y: 0, width: len, height: t))
+            c.setFillColor(pal.deepNavy); c.fill(CGRect(x: 0, y: 0, width: len, height: t))
             // thin cream rails
-            c.setFillColor(Palette.cream)
+            c.setFillColor(pal.cream)
             c.fill(CGRect(x: 0, y: 6, width: len, height: 4))
             c.fill(CGRect(x: 0, y: t - 10, width: len, height: 4))
             // meandering vine
@@ -90,44 +91,44 @@ enum RugTextureGenerator {
                 )
                 x += period
             }
-            c.setStrokeColor(Palette.cream); c.setLineWidth(5); c.addPath(path); c.strokePath()
+            c.setStrokeColor(pal.cream); c.setLineWidth(5); c.addPath(path); c.strokePath()
             // motifs along the vine
             x = period / 2
             var k = 0
             while x < len - period / 4 {
                 if k % 2 == 0 {
-                    drawRosette(c, center: CGPoint(x: x, y: mid), radius: t * 0.33, petal: Palette.gold, core: Palette.red, outline: Palette.cream)
+                    drawRosette(c, center: CGPoint(x: x, y: mid), radius: t * 0.33, petal: pal.gold, core: pal.red, outline: pal.cream)
                 } else {
-                    drawPalmette(c, center: CGPoint(x: x, y: mid), size: t * 0.36, fill: Palette.cream, accent: Palette.red, outline: Palette.gold)
+                    drawPalmette(c, center: CGPoint(x: x, y: mid), size: t * 0.36, fill: pal.cream, accent: pal.red, outline: pal.gold)
                 }
                 // small diamonds between motifs
-                drawDiamond(c, center: CGPoint(x: x + period / 2, y: mid + t * 0.3), w: 16, h: 22, fill: Palette.red, outline: Palette.cream)
-                drawDiamond(c, center: CGPoint(x: x + period / 2, y: mid - t * 0.3), w: 16, h: 22, fill: Palette.red, outline: Palette.cream)
+                drawDiamond(c, center: CGPoint(x: x + period / 2, y: mid + t * 0.3), w: 16, h: 22, fill: pal.red, outline: pal.cream)
+                drawDiamond(c, center: CGPoint(x: x + period / 2, y: mid - t * 0.3), w: 16, h: 22, fill: pal.red, outline: pal.cream)
                 x += period; k += 1
             }
         }
         // corner squares of the main border
         for cx in [outerGuard + mainBorder / 2, w - outerGuard - mainBorder / 2] {
             for cy in [outerGuard + mainBorder / 2, h - outerGuard - mainBorder / 2] {
-                ctx.setFillColor(Palette.deepNavy)
+                ctx.setFillColor(pal.deepNavy)
                 ctx.fill(CGRect(x: cx - mainBorder / 2, y: cy - mainBorder / 2, width: mainBorder, height: mainBorder))
-                drawDiamond(ctx, center: CGPoint(x: cx, y: cy), w: mainBorder * 0.7, h: mainBorder * 0.7, fill: Palette.red, outline: Palette.cream)
-                drawRosette(ctx, center: CGPoint(x: cx, y: cy), radius: mainBorder * 0.22, petal: Palette.gold, core: Palette.navy, outline: Palette.cream)
+                drawDiamond(ctx, center: CGPoint(x: cx, y: cy), w: mainBorder * 0.7, h: mainBorder * 0.7, fill: pal.red, outline: pal.cream)
+                drawRosette(ctx, center: CGPoint(x: cx, y: cy), radius: mainBorder * 0.22, petal: pal.gold, core: pal.navy, outline: pal.cream)
             }
         }
         drawBand(ctx, inset: outerGuard + mainBorder, thickness: innerGuard, size: CGSize(width: w, height: h)) { c, len, t in
-            c.setFillColor(Palette.cream); c.fill(CGRect(x: 0, y: 0, width: len, height: t))
+            c.setFillColor(pal.cream); c.fill(CGRect(x: 0, y: 0, width: len, height: t))
             // S-chain in red and navy
             let step: CGFloat = 44
             var x: CGFloat = 0; var k = 0
             while x < len {
                 drawDiamond(c, center: CGPoint(x: x + step / 2, y: t / 2), w: 22, h: t - 14,
-                            fill: k % 2 == 0 ? Palette.red : Palette.navy, outline: nil)
+                            fill: k % 2 == 0 ? pal.red : pal.navy, outline: nil)
                 x += step; k += 1
             }
         }
         drawBand(ctx, inset: outerGuard + mainBorder + innerGuard, thickness: outline, size: CGSize(width: w, height: h)) { c, len, t in
-            c.setFillColor(Palette.navy); c.fill(CGRect(x: 0, y: 0, width: len, height: t))
+            c.setFillColor(pal.navy); c.fill(CGRect(x: 0, y: 0, width: len, height: t))
         }
 
         // --- Field contents ---
@@ -137,79 +138,85 @@ enum RugTextureGenerator {
         let spandrelRX: CGFloat = 400, spandrelRY: CGFloat = 310
 
         // Spandrels in the four field corners (quarter medallions)
+        if !style.allover {
         ctx.saveGState()
         ctx.clip(to: field)
         for cx in [field.minX, field.maxX] {
             for cy in [field.minY, field.maxY] {
                 let cc = CGPoint(x: cx, y: cy)
-                fillLobed(ctx, center: cc, rx: spandrelRX, ry: spandrelRY, lobes: 20, depth: 0.05, fill: Palette.navy, stroke: Palette.cream, lineWidth: 6)
-                fillLobed(ctx, center: cc, rx: spandrelRX - 60, ry: spandrelRY - 50, lobes: 20, depth: 0.05, fill: nil, stroke: Palette.gold, lineWidth: 4)
+                fillLobed(ctx, center: cc, rx: spandrelRX, ry: spandrelRY, lobes: 20, depth: 0.05, fill: pal.navy, stroke: pal.cream, lineWidth: 6)
+                fillLobed(ctx, center: cc, rx: spandrelRX - 60, ry: spandrelRY - 50, lobes: 20, depth: 0.05, fill: nil, stroke: pal.gold, lineWidth: 4)
                 // small rosettes inside the spandrel along an arc
                 let sx: CGFloat = cx == field.minX ? 1 : -1
                 let sy: CGFloat = cy == field.minY ? 1 : -1
                 for a in stride(from: CGFloat(0.18), through: 1.4, by: 0.4) {
                     let px = cx + sx * cos(a) * (spandrelRX - 150)
                     let py = cy + sy * sin(a) * (spandrelRY - 120)
-                    drawRosette(ctx, center: CGPoint(x: px, y: py), radius: 26, petal: Palette.cream, core: Palette.gold, outline: nil)
+                    drawRosette(ctx, center: CGPoint(x: px, y: py), radius: 26, petal: pal.cream, core: pal.gold, outline: nil)
                 }
-                drawPalmette(ctx, center: CGPoint(x: cx + sx * 110, y: cy + sy * 90), size: 48, fill: Palette.gold, accent: Palette.red, outline: Palette.cream)
+                drawPalmette(ctx, center: CGPoint(x: cx + sx * 110, y: cy + sy * 90), size: 48, fill: pal.gold, accent: pal.red, outline: pal.cream)
             }
         }
         ctx.restoreGState()
+        }
 
         // Field filler lattice (herati-style sprigs), avoiding medallion and spandrels
-        let dx: CGFloat = 128, dy: CGFloat = 112
+        let dx: CGFloat = style.allover ? 104 : 128, dy: CGFloat = style.allover ? 92 : 112
         var row = 0
         var fy = field.minY + 60
         while fy < field.maxY - 40 {
             var fx = field.minX + 60 + (row % 2 == 0 ? 0 : dx / 2)
             while fx < field.maxX - 40 {
                 let p = CGPoint(x: fx, y: fy)
-                let inMed = ellipseDist(p, center, medRX + 90, medRY + 80) < 1
+                let inMed = !style.allover && ellipseDist(p, center, medRX + 90, medRY + 80) < 1
                 var inSpan = false
-                for cx in [field.minX, field.maxX] {
-                    for cy in [field.minY, field.maxY] where ellipseDist(p, CGPoint(x: cx, y: cy), spandrelRX + 40, spandrelRY + 40) < 1 { inSpan = true }
+                if !style.allover {
+                    for cx in [field.minX, field.maxX] {
+                        for cy in [field.minY, field.maxY] where ellipseDist(p, CGPoint(x: cx, y: cy), spandrelRX + 40, spandrelRY + 40) < 1 { inSpan = true }
+                    }
                 }
                 if !inMed && !inSpan {
-                    drawSprig(ctx, center: p, variant: (row + Int(fx / dx)) % 3)
+                    drawSprig(ctx, center: p, variant: (row + Int(fx / dx)) % 3, pal: pal)
                 }
                 fx += dx
             }
             fy += dy; row += 1
         }
 
+        if !style.allover {
         // Pendants on the long axis
         for s in [CGFloat(-1), 1] {
             let px = center.x + s * (medRX + 95)
-            ctx.setFillColor(Palette.navy)
+            ctx.setFillColor(pal.navy)
             ctx.fill(CGRect(x: min(center.x + s * medRX, px), y: center.y - 5, width: 95, height: 10))
-            fillLobed(ctx, center: CGPoint(x: px + s * 10, y: center.y), rx: 78, ry: 60, lobes: 12, depth: 0.08, fill: Palette.navy, stroke: Palette.cream, lineWidth: 5)
-            drawDiamond(ctx, center: CGPoint(x: px + s * 10, y: center.y), w: 60, h: 48, fill: Palette.gold, outline: Palette.cream)
-            drawDiamond(ctx, center: CGPoint(x: px + s * 10, y: center.y), w: 26, h: 20, fill: Palette.red, outline: nil)
+            fillLobed(ctx, center: CGPoint(x: px + s * 10, y: center.y), rx: 78, ry: 60, lobes: 12, depth: 0.08, fill: pal.navy, stroke: pal.cream, lineWidth: 5)
+            drawDiamond(ctx, center: CGPoint(x: px + s * 10, y: center.y), w: 60, h: 48, fill: pal.gold, outline: pal.cream)
+            drawDiamond(ctx, center: CGPoint(x: px + s * 10, y: center.y), w: 26, h: 20, fill: pal.red, outline: nil)
         }
 
         // Central medallion
-        fillLobed(ctx, center: center, rx: medRX, ry: medRY, lobes: 16, depth: 0.07, fill: Palette.navy, stroke: Palette.cream, lineWidth: 7)
-        fillLobed(ctx, center: center, rx: medRX - 48, ry: medRY - 36, lobes: 16, depth: 0.06, fill: Palette.cream, stroke: Palette.gold, lineWidth: 4)
-        fillLobed(ctx, center: center, rx: medRX - 78, ry: medRY - 58, lobes: 16, depth: 0.05, fill: Palette.red, stroke: Palette.navy, lineWidth: 4)
+        fillLobed(ctx, center: center, rx: medRX, ry: medRY, lobes: 16, depth: 0.07, fill: pal.navy, stroke: pal.cream, lineWidth: 7)
+        fillLobed(ctx, center: center, rx: medRX - 48, ry: medRY - 36, lobes: 16, depth: 0.06, fill: pal.cream, stroke: pal.gold, lineWidth: 4)
+        fillLobed(ctx, center: center, rx: medRX - 78, ry: medRY - 58, lobes: 16, depth: 0.05, fill: pal.red, stroke: pal.navy, lineWidth: 4)
         // ring of small rosettes in the cream band
         for k in 0..<16 {
             let a = CGFloat(k) / 16 * 2 * .pi
             let p = CGPoint(x: center.x + cos(a) * (medRX - 63), y: center.y + sin(a) * (medRY - 47))
-            drawDiamond(ctx, center: p, w: 14, h: 14, fill: k % 2 == 0 ? Palette.navy : Palette.red, outline: nil)
+            drawDiamond(ctx, center: p, w: 14, h: 14, fill: k % 2 == 0 ? pal.navy : pal.red, outline: nil)
         }
-        fillStar(ctx, center: center, outer: 215, inner: 150, points: 8, rotation: .pi / 8, fill: Palette.navy, stroke: Palette.cream, lineWidth: 5)
-        fillStar(ctx, center: center, outer: 170, inner: 118, points: 8, rotation: 0, fill: Palette.gold, stroke: Palette.cream, lineWidth: 3)
-        ctx.setFillColor(Palette.red)
+        fillStar(ctx, center: center, outer: 215, inner: 150, points: 8, rotation: .pi / 8, fill: pal.navy, stroke: pal.cream, lineWidth: 5)
+        fillStar(ctx, center: center, outer: 170, inner: 118, points: 8, rotation: 0, fill: pal.gold, stroke: pal.cream, lineWidth: 3)
+        ctx.setFillColor(pal.red)
         ctx.fillEllipse(in: CGRect(x: center.x - 112, y: center.y - 112, width: 224, height: 224))
-        ctx.setStrokeColor(Palette.cream); ctx.setLineWidth(4)
+        ctx.setStrokeColor(pal.cream); ctx.setLineWidth(4)
         ctx.strokeEllipse(in: CGRect(x: center.x - 112, y: center.y - 112, width: 224, height: 224))
-        drawRosette(ctx, center: center, radius: 92, petal: Palette.navy, core: Palette.gold, outline: Palette.cream)
-        drawRosette(ctx, center: center, radius: 40, petal: Palette.cream, core: Palette.red, outline: nil)
+        drawRosette(ctx, center: center, radius: 92, petal: pal.navy, core: pal.gold, outline: pal.cream)
+        drawRosette(ctx, center: center, radius: 40, petal: pal.cream, core: pal.red, outline: nil)
         for k in 0..<8 {
             let a = CGFloat(k) / 8 * 2 * .pi + .pi / 8
             let p = CGPoint(x: center.x + cos(a) * 190, y: center.y + sin(a) * 190)
-            drawRosette(ctx, center: p, radius: 16, petal: Palette.cream, core: Palette.red, outline: nil)
+            drawRosette(ctx, center: p, radius: 16, petal: pal.cream, core: pal.red, outline: nil)
+        }
         }
 
         // --- Fibre noise overlay for a woven, non-vector look ---
@@ -225,6 +232,12 @@ enum RugTextureGenerator {
     }
 
     // MARK: - Drawing helpers
+
+    private static func shade(_ color: CGColor, by t: CGFloat) -> CGColor {
+        let c = color.components ?? [0, 0, 0, 1]
+        return CGColor(srgbRed: min(max(c[0] + t, 0), 1), green: min(max(c[1] + t * 0.6, 0), 1),
+                       blue: min(max(c[2] + t * 0.6, 0), 1), alpha: 1)
+    }
 
     /// Draws `body` four times, once per side, with the context transformed so the band runs
     /// along +X from 0...len and spans 0...thickness in Y (with Y pointing toward the center).
@@ -332,9 +345,9 @@ enum RugTextureGenerator {
     }
 
     /// Small field sprig: a diamond with four leaves.
-    private static func drawSprig(_ ctx: CGContext, center: CGPoint, variant: Int) {
-        let leaf: CGColor = variant == 0 ? Palette.teal : (variant == 1 ? Palette.navy : Palette.gold)
-        let core: CGColor = variant == 2 ? Palette.navy : Palette.cream
+    private static func drawSprig(_ ctx: CGContext, center: CGPoint, variant: Int, pal: RugPalette) {
+        let leaf: CGColor = variant == 0 ? pal.teal : (variant == 1 ? pal.navy : pal.gold)
+        let core: CGColor = variant == 2 ? pal.navy : pal.cream
         for k in 0..<4 {
             let a = CGFloat(k) * .pi / 2 + .pi / 4
             ctx.saveGState()
@@ -344,8 +357,8 @@ enum RugTextureGenerator {
             ctx.fillEllipse(in: CGRect(x: 14, y: -7, width: 30, height: 14))
             ctx.restoreGState()
         }
-        drawDiamond(ctx, center: center, w: 26, h: 26, fill: core, outline: Palette.ink)
-        drawDiamond(ctx, center: center, w: 10, h: 10, fill: Palette.red, outline: nil)
+        drawDiamond(ctx, center: center, w: 26, h: 26, fill: core, outline: pal.ink)
+        drawDiamond(ctx, center: center, w: 10, h: 10, fill: pal.red, outline: nil)
     }
 
     private static func makeNoiseTile(size: Int, rng: inout SplitMix64) -> CGImage? {

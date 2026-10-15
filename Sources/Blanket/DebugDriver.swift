@@ -8,8 +8,12 @@ final class DebugDriver {
     private let dir: URL
     private var timers: [Timer] = []
 
+    static var isEnabled: Bool {
+        !(ProcessInfo.processInfo.environment["BLANKET_SNAPSHOT_DIR"] ?? "").isEmpty
+    }
+
     init?(view: RugView) {
-        guard let path = ProcessInfo.processInfo.environment["BLANKET_SNAPSHOT_DIR"], !path.isEmpty else { return nil }
+        guard DebugDriver.isEnabled, let path = ProcessInfo.processInfo.environment["BLANKET_SNAPSHOT_DIR"] else { return nil }
         self.view = view
         dir = URL(fileURLWithPath: path, isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -18,10 +22,11 @@ final class DebugDriver {
     func start() {
         let size = view.bounds.size
         let W = Float(size.width), H = Float(size.height)
-        // Grab near the lower-right corner of the rug and pull it up-left across the screen.
-        let start = SIMD2<Float>(W * 0.88, H * 0.12)
-        let end = SIMD2<Float>(W * 0.45, H * 0.55)
+        // Grab just inside the rug's lower-right corner and pull it up-left across the screen.
         let grid = view.debugGrid
+        let corner = view.debugParticlePosition(i: grid.cols - 2, j: 1)
+        let start = SIMD2<Float>(corner.x, corner.y)
+        let end = SIMD2<Float>(W * 0.45, H * 0.55)
 
         schedule(1.0) { self.snapshot("1-rest") }
         schedule(1.2) { self.view.debugBeginGrab(at: start) }

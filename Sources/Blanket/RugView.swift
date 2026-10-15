@@ -3,6 +3,51 @@ import QuartzCore
 import SceneKit
 import simd
 
+/// Everything needed to (re)build a rug in a view.
+struct RugConfig {
+    var assets: RugAssets
+    var coverage: Float
+    /// Saved particle positions to restore, if their count matches the new grid.
+    var restore: [SIMD3<Float>]? = nil
+}
+
+/// The simulation, geometry builders and materials for one rug. Replaced wholesale when the
+/// style, image or size changes.
+final class RugState {
+    let sim: ClothSimulation
+    let clothGeo: ClothGeometry
+    let fringeGeo: FringeGeometry
+    let edgeGeo: EdgeGeometry
+    let rugMaterial: SCNMaterial
+    let undersideMaterial: SCNMaterial
+    let config: RugConfig
+
+    init(config: RugConfig, viewSize: CGSize) {
+        self.config = config
+        let W = Float(viewSize.width), H = Float(viewSize.height)
+        let aspect = Float(config.assets.aspect)
+        let c = config.coverage
+        let rugH = min(c * H, c * W / aspect)
+        let rugW = rugH * aspect
+        let cols = 72
+        let spacing = rugW / Float(cols - 1)
+        let rows = max(8, Int((rugH / spacing).rounded()) + 1)
+        let origin = SIMD2<Float>((W - rugW) / 2, (H - Float(rows - 1) * spacing) / 2)
+
+        sim = ClothSimulation(cols: cols, rows: rows, spacing: spacing, origin: origin)
+        // Keep at least a hand's width of rug on screen.
+        let fence: Float = 80
+        sim.bounds = (SIMD2<Float>(-rugW + fence, -Float(rows - 1) * spacing + fence), SIMD2<Float>(W - fence, H - fence))
+        if let saved = config.restore, saved.count == sim.count { sim.load(positions: saved) }
+
+        clothGeo = ClothGeometry(cols: cols, rows: rows)
+        fringeGeo = FringeGeometry(cols: cols, rows: rows, length: spacing * 1.7)
+        edgeGeo = EdgeGeometry(cols: cols, rows: rows, depth: sim.thickness)
+        rugMaterial = RugMaterial.makeRug(image: config.assets.top, rugAspect: config.assets.aspect)
+        undersideMaterial = RugMaterial.makeUnderside(image: config.assets.underside, rugAspect: config.assets.aspect)
+    }
+}
+
 /// Transparent SceneKit view that renders the rug and drives the cloth simulation.
 final class RugView: SCNView, SCNSceneRendererDelegate {
     private struct Input {
@@ -12,15 +57,12 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
         var target = SIMD3<Float>(0, 0, 0)
         var releaseVelocity: SIMD3<Float>?
         var wantsReset = false
+        var pendingConfig: RugConfig?
         var isGrabbing: Bool { !grabIndices.isEmpty }
     }
 
-    private let sim: ClothSimulation
-    private let clothGeo: ClothGeometry
-    private let fringeGeo: FringeGeometry
-    private let edgeGeo: EdgeGeometry
-    private let rugMaterial: SCNMaterial
-    private let undersideMaterial: SCNMaterial
+    /// Owned by the render thread; the reference itself is swapped under `inputLock`.
+    private var rug: RugState
     private let selvedgeMaterial = RugMaterial.makeSelvedge()
     private let shadowMaterial = RugMaterial.makeShadow()
     private let fringeMaterial = RugMaterial.makeFringe()
@@ -52,6 +94,9 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
     private var snapshot: [SIMD3<Float>] = []
     private var lastTime: TimeInterval?
 
+    /// Called on the main thread whenever the cloth falls asleep (used to persist its shape).
+    var onSettle: (() -> Void)?
+
     // Interaction state (main thread only)
     private(set) var isDragging = false
     private var grabOffset = SIMD2<Float>(0, 0)
@@ -72,34 +117,13 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
     }
     /// Light travel direction; also used to project the fake floor shadow.
     private let lightDirection = simd_normalize(SIMD3<Float>(0.28, -0.22, -1))
-    /// Orthographic top-down camera instead of the mild perspective one (debugging aid).
-    static var useFlatCamera = ProcessInfo.processInfo.environment["BLANKET_FLAT_CAMERA"] != nil
+    private let flatCamera = Settings.flatCamera
     private let perspectiveFOV: Float = 14
 
-    override init(frame: NSRect, options: [String: Any]? = nil) {
-        // Rug ~1.45:1, covering most of the screen.
-        let W = Float(frame.width), H = Float(frame.height)
-        let aspect: Float = 1.45
-        let rugH = min(0.84 * H, 0.84 * W / aspect)
-        let rugW = rugH * aspect
-        let cols = 72
-        let spacing = rugW / Float(cols - 1)
-        let rows = Int((rugH / spacing).rounded()) + 1
-        let origin = SIMD2<Float>((W - rugW) / 2, (H - Float(rows - 1) * spacing) / 2)
-
-        sim = ClothSimulation(cols: cols, rows: rows, spacing: spacing, origin: origin)
-        // Keep at least a hand's width of rug on screen.
-        let fence: Float = 80
-        sim.bounds = (SIMD2<Float>(-rugW + fence, -Float(rows - 1) * spacing + fence), SIMD2<Float>(W - fence, H - fence))
-        clothGeo = ClothGeometry(cols: cols, rows: rows)
-        fringeGeo = FringeGeometry(cols: cols, rows: rows, length: spacing * 1.7)
-        edgeGeo = EdgeGeometry(cols: cols, rows: rows, depth: sim.thickness)
-        let top = RugTextureGenerator.makeRugImage()
-        rugMaterial = RugMaterial.makeRug(image: top, rugAspect: CGFloat(rugW / rugH))
-        undersideMaterial = RugMaterial.makeUnderside(image: RugTextureGenerator.makeUndersideImage(from: top), rugAspect: CGFloat(rugW / rugH))
-
-        super.init(frame: frame, options: options)
-        snapshot = sim.pos
+    init(frame: NSRect, config: RugConfig) {
+        rug = RugState(config: config, viewSize: frame.size)
+        super.init(frame: frame, options: nil)
+        snapshot = rug.sim.pos
         configureView()
         buildScene()
         viewportChanged(to: frame.size)
@@ -127,7 +151,7 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
         self.scene = scene
 
         let camera = SCNCamera()
-        camera.usesOrthographicProjection = RugView.useFlatCamera
+        camera.usesOrthographicProjection = flatCamera
         camera.projectionDirection = .vertical
         camera.fieldOfView = CGFloat(perspectiveFOV)
         camera.zNear = 10
@@ -186,7 +210,7 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
         // Shear-project everything onto the desk (z ≈ 0) along the light direction.
         let a = -lightDirection.x / lightDirection.z
         let b = -lightDirection.y / lightDirection.z
-        let t = sim.thickness
+        let t = rug.sim.thickness
         var proj = matrix_identity_float4x4
         proj.columns.2 = SIMD4<Float>(a, b, 0.001, 0)
         proj.columns.3 = SIMD4<Float>(-a * t, -b * t, 0.6, 1)
@@ -199,7 +223,7 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
     func viewportChanged(to size: CGSize) {
         let W = Float(size.width), H = Float(size.height)
         // Distance at which the desk plane (z = 0) maps 1:1 onto screen points.
-        let distance = RugView.useFlatCamera ? 2000 : (H / 2) / tan(perspectiveFOV * .pi / 360)
+        let distance = flatCamera ? 2000 : (H / 2) / tan(perspectiveFOV * .pi / 360)
         cameraNode.simdPosition = SIMD3<Float>(W / 2, H / 2, distance)
         cameraNode.simdOrientation = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 0, 1))
         cameraNode.camera?.orthographicScale = Double(H / 2)
@@ -208,16 +232,17 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
     }
 
     private func rebuildGeometry() {
-        let geo = clothGeo.makeGeometry(from: sim, material: rugMaterial)
+        let r = rug
+        let geo = r.clothGeo.makeGeometry(from: r.sim, material: r.rugMaterial)
         clothNode.geometry = geo
         let backGeo = geo.copy() as! SCNGeometry
-        backGeo.materials = [undersideMaterial]
+        backGeo.materials = [r.undersideMaterial]
         backNode.geometry = backGeo
-        edgeNode.geometry = edgeGeo.makeGeometry(from: sim, normals: clothGeo.normals, material: selvedgeMaterial)
+        edgeNode.geometry = r.edgeGeo.makeGeometry(from: r.sim, normals: r.clothGeo.normals, material: selvedgeMaterial)
         let shadowGeo = geo.copy() as! SCNGeometry
         shadowGeo.materials = [shadowMaterial]
         shadowNode.geometry = shadowGeo
-        let fringe = fringeGeo.makeGeometry(from: sim, material: fringeMaterial)
+        let fringe = r.fringeGeo.makeGeometry(from: r.sim, material: fringeMaterial)
         fringeNode.geometry = fringe
         let fringeShadow = fringe.copy() as! SCNGeometry
         fringeShadow.materials = [fringeShadowMaterial]
@@ -225,6 +250,29 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
     }
 
     // MARK: - Public controls (main thread)
+
+    /// Replace the rug (style, image or size). Applied on the next simulation frame.
+    func apply(_ config: RugConfig) {
+        inputLock.lock()
+        input.pendingConfig = config
+        input.grabIndices = []
+        input.grabOffsets = []
+        inputLock.unlock()
+        isDragging = false
+        resume()
+    }
+
+    /// The configuration currently shown (or about to be).
+    var currentConfig: RugConfig {
+        inputLock.lock(); defer { inputLock.unlock() }
+        return input.pendingConfig ?? rug.config
+    }
+
+    /// Current particle positions and grid, for persistence.
+    func currentShape() -> (positions: [SIMD3<Float>], cols: Int, rows: Int) {
+        inputLock.lock(); defer { inputLock.unlock() }
+        return (snapshot, rug.sim.cols, rug.sim.rows)
+    }
 
     /// Restart the render/simulation loop (it pauses itself while the cloth sleeps).
     func resume() {
@@ -239,9 +287,12 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self, !self.isDragging else { return }
             self.inputLock.lock()
-            let busy = self.input.isGrabbing || self.input.wantsReset
+            let busy = self.input.isGrabbing || self.input.wantsReset || self.input.pendingConfig != nil
             self.inputLock.unlock()
-            if !busy { self.isPlaying = false }
+            if !busy {
+                self.isPlaying = false
+                self.onSettle?()
+            }
         }
     }
 
@@ -259,8 +310,9 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
     func isPointOverCloth(_ p: CGPoint) -> Bool {
         inputLock.lock()
         let snap = snapshot
+        let cols = rug.sim.cols, rows = rug.sim.rows
         inputLock.unlock()
-        return ClothSimulation.contains(point: SIMD2(Float(p.x), Float(p.y)), positions: snap, cols: sim.cols, rows: sim.rows)
+        return ClothSimulation.contains(point: SIMD2(Float(p.x), Float(p.y)), positions: snap, cols: cols, rows: rows)
     }
 
     // MARK: - Mouse
@@ -282,6 +334,7 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
     private func beginGrab(at q: SIMD2<Float>, wide: Bool, keepOffset: Bool) -> Bool {
         inputLock.lock()
         let snap = snapshot
+        let sim = rug.sim
         inputLock.unlock()
         let pickRadius = sim.spacing * (wide ? 3 : 1.6)
         guard let center = ClothSimulation.nearestParticle(to: q, positions: snap, maxDistance: pickRadius) else { return false }
@@ -317,6 +370,13 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
         return true
     }
 
+    private func setTarget(_ q: SIMD2<Float>) {
+        inputLock.lock()
+        let thickness = rug.sim.thickness
+        input.target = SIMD3<Float>(q.x + grabOffset.x, q.y + grabOffset.y, thickness + currentLift)
+        inputLock.unlock()
+    }
+
     override func mouseDragged(with event: NSEvent) {
         guard isDragging else { return }
         let p = convert(event.locationInWindow, from: nil)
@@ -328,9 +388,7 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
         lastDragTime = event.timestamp
         let speed = simd_length(dragVelocity)
         currentLift = currentLift * 0.7 + liftFor(speed: speed) * 0.3
-        inputLock.lock()
-        input.target = SIMD3<Float>(q.x + grabOffset.x, q.y + grabOffset.y, sim.thickness + currentLift)
-        inputLock.unlock()
+        setTarget(q)
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -339,27 +397,35 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
         NSCursor.pop()
         // Stale velocity if the mouse paused before release.
         if event.timestamp - lastDragTime > 0.08 { dragVelocity = .zero }
+        endGrab(velocity: dragVelocity)
+    }
+
+    private func endGrab(velocity: SIMD2<Float>) {
         inputLock.lock()
         input.grabIndices = []
         input.grabOffsets = []
-        input.releaseVelocity = SIMD3<Float>(dragVelocity.x, dragVelocity.y, 0)
+        input.releaseVelocity = SIMD3<Float>(velocity.x, velocity.y, 0)
         inputLock.unlock()
     }
 
     // MARK: - Programmatic interaction (debug / tests)
 
-    var debugIsAsleep: Bool { sim.isAsleep }
+    var debugIsAsleep: Bool { rug.sim.isAsleep }
 
     /// Last published position of the particle at grid coordinates (i, j).
     func debugParticlePosition(i: Int, j: Int) -> SIMD3<Float> {
         inputLock.lock()
         let snap = snapshot
+        let cols = rug.sim.cols
         inputLock.unlock()
-        let k = j * sim.cols + i
+        let k = j * cols + i
         return k >= 0 && k < snap.count ? snap[k] : .zero
     }
 
-    var debugGrid: (cols: Int, rows: Int) { (sim.cols, sim.rows) }
+    var debugGrid: (cols: Int, rows: Int) {
+        inputLock.lock(); defer { inputLock.unlock() }
+        return (rug.sim.cols, rug.sim.rows)
+    }
 
     /// Stretch ratio between the grabbed particle and the particle `cells` steps toward the rug
     /// centre along its row: 1.0 means inextensible, 1.3 means the rug stretched 30 % like rubber.
@@ -367,6 +433,7 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
         inputLock.lock()
         let snap = snapshot
         let k = input.grabIndices.first
+        let sim = rug.sim
         inputLock.unlock()
         guard let k, snap.count == sim.count else { return 0 }
         let i = k % sim.cols, j = k / sim.cols
@@ -382,18 +449,12 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
 
     func debugMoveGrab(to q: SIMD2<Float>, speed: Float = 600) {
         currentLift = currentLift * 0.7 + liftFor(speed: speed) * 0.3
-        inputLock.lock()
-        input.target = SIMD3<Float>(q.x, q.y, sim.thickness + currentLift)
-        inputLock.unlock()
+        setTarget(q)
     }
 
     func debugEndGrab(velocity: SIMD2<Float>) {
         isDragging = false
-        inputLock.lock()
-        input.grabIndices = []
-        input.grabOffsets = []
-        input.releaseVelocity = SIMD3<Float>(velocity.x, velocity.y, 0)
-        inputLock.unlock()
+        endGrab(velocity: velocity)
     }
 
     // MARK: - SCNSceneRendererDelegate (render thread)
@@ -407,7 +468,20 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
         let inp = input
         input.releaseVelocity = nil
         input.wantsReset = false
+        input.pendingConfig = nil
         inputLock.unlock()
+
+        var rebuilt = false
+        if let cfg = inp.pendingConfig {
+            let next = RugState(config: cfg, viewSize: bounds.size)
+            inputLock.lock()
+            rug = next
+            snapshot = next.sim.pos
+            inputLock.unlock()
+            appliedGeneration = 0
+            rebuilt = true
+        }
+        let sim = rug.sim
 
         if inp.wantsReset { sim.reset() }
 
@@ -424,7 +498,7 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
 
         let wasAsleep = sim.isAsleep
         let t0 = CACurrentMediaTime()
-        let changed = sim.step(dt: dt) || inp.wantsReset
+        let changed = sim.step(dt: dt) || inp.wantsReset || rebuilt
         let t1 = CACurrentMediaTime()
         if changed {
             rebuildGeometry()

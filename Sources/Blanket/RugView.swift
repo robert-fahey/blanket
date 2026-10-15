@@ -35,9 +35,8 @@ final class RugState {
         let origin = SIMD2<Float>((W - rugW) / 2, (H - Float(rows - 1) * spacing) / 2)
 
         sim = ClothSimulation(cols: cols, rows: rows, spacing: spacing, origin: origin)
-        // Keep at least a hand's width of rug on screen.
-        let fence: Float = 80
-        sim.bounds = (SIMD2<Float>(-rugW + fence, -Float(rows - 1) * spacing + fence), SIMD2<Float>(W - fence, H - fence))
+        // The rug may hang off the screen, but never leave it entirely.
+        sim.bounds = (SIMD2<Float>(0, 0), SIMD2<Float>(W, H))
         if let saved = config.restore, saved.count == sim.count { sim.load(positions: saved) }
 
         clothGeo = ClothGeometry(cols: cols, rows: rows)

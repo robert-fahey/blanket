@@ -75,8 +75,10 @@ final class ClothSimulation {
     /// Every particle carries a collision sphere of this diameter (in grid spacings). At 1.0 the
     /// spheres of a sheet overlap enough that nothing, points or edges, can thread between them.
     var contactDiameter: Float = 1.0
-    /// Particles are kept inside this XY rectangle so the rug can never be dragged out of reach.
+    /// The visible screen rectangle. Particles may leave it freely, but when nobody is holding the
+    /// rug at least `fence` points of its extent are kept inside, so it can never be lost.
     var bounds: (min: SIMD2<Float>, max: SIMD2<Float>)?
+    var fence: Float = 80
 
     private(set) var isAsleep = false
     private(set) var grabs: [Grab] = []
@@ -289,14 +291,9 @@ final class ClothSimulation {
                                 }
                             }
                             profileSolve += CACurrentMediaTime() - tSolve
-                            // Floor collision + friction, and the screen fence
+                            // Floor collision + friction
                             for k in 0..<p.count where w[k] > 0 {
                                 var x = p[k]
-                                if let b = bounds {
-                                    if x.x < b.min.x { x.x = b.min.x } else if x.x > b.max.x { x.x = b.max.x }
-                                    if x.y < b.min.y { x.y = b.min.y } else if x.y > b.max.y { x.y = b.max.y }
-                                    p[k] = x
-                                }
                                 if x.z < floorZ {
                                     x.z = floorZ
                                     // Coulomb-ish: remove a fraction of tangential motion while touching.
@@ -327,6 +324,7 @@ final class ClothSimulation {
             }
         }
         maxZ = highest
+        if !isGrabbing { keepOnScreen() }
         let move = maxMove.squareRoot()
         lastMaxMove = move
 
@@ -514,6 +512,22 @@ final class ClothSimulation {
             }
         }
         return count
+    }
+
+    /// Rigidly shift the whole rug back if less than `fence` points of it remain on screen.
+    private func keepOnScreen() {
+        guard let b = bounds else { return }
+        var lo = SIMD2<Float>(Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude)
+        var hi = -lo
+        for v in pos { lo = simd_min(lo, SIMD2(v.x, v.y)); hi = simd_max(hi, SIMD2(v.x, v.y)) }
+        var shift = SIMD2<Float>(0, 0)
+        if hi.x < b.min.x + fence { shift.x = b.min.x + fence - hi.x }
+        if lo.x > b.max.x - fence { shift.x = b.max.x - fence - lo.x }
+        if hi.y < b.min.y + fence { shift.y = b.min.y + fence - hi.y }
+        if lo.y > b.max.y - fence { shift.y = b.max.y - fence - lo.y }
+        guard shift != .zero else { return }
+        let d = SIMD3<Float>(shift.x, shift.y, 0)
+        for k in 0..<count { pos[k] += d; prev[k] += d }
     }
 
     /// Debug: the particles that moved most in the last substep, with grid coords and height.

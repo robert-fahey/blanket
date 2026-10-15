@@ -79,8 +79,10 @@ final class DebugDriver {
         schedule(6.5) {
             self.snapshot("7-wide-settled")
             let n = max(self.view.profileFrames, 1)
-            self.log(String(format: "profile: %d active frames, step %.2f ms, geometry %.2f ms (avg per frame)",
-                            n, self.view.profileStepSeconds / Double(n) * 1000, self.view.profileGeometrySeconds / Double(n) * 1000))
+            self.log(String(format: "profile: %d active frames, step %.2f ms (solve %.2f, stack %.2f), geometry %.2f ms (avg per frame)",
+                            n, self.view.profileStepSeconds / Double(n) * 1000,
+                            self.view.debugProfileSolve / Double(n) * 1000, self.view.debugProfileStack / Double(n) * 1000,
+                            self.view.profileGeometrySeconds / Double(n) * 1000))
             NSApp.terminate(nil)
         }
     }
@@ -99,6 +101,6 @@ final class DebugDriver {
               let rep = NSBitmapImageRep(data: tiff),
               let png = rep.representation(using: .png, properties: [:]) else { return }
         try? png.write(to: dir.appendingPathComponent("\(name).png"))
-        log(String(format: "snapshot %@ asleep=%d maxMove=%.4f", name, view.debugIsAsleep ? 1 : 0, view.debugMaxMove))
+        log(String(format: "snapshot %@ asleep=%d maxMove=%.4f penetrations=%d", name, view.debugIsAsleep ? 1 : 0, view.debugMaxMove, view.debugPenetrations()))
     }
 }

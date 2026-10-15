@@ -412,6 +412,16 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
 
     var debugIsAsleep: Bool { rug.sim.isAsleep }
     var debugMaxMove: Float { rug.sim.lastMaxMove }
+    var debugProfileSolve: Double { rug.sim.profileSolve }
+    var debugProfileStack: Double { rug.sim.profileStack }
+    /// Particles that sit inside or within half a layer of a distant part of the cloth.
+    func debugPenetrations() -> Int {
+        inputLock.lock()
+        let snap = snapshot
+        let sim = rug.sim
+        inputLock.unlock()
+        return ClothSimulation.penetrations(positions: snap, cols: sim.cols, rows: sim.rows, separation: sim.layerSeparation)
+    }
     func debugTopMovers(_ n: Int) -> String {
         let sim = rug.sim
         let b = sim.bounds.map { "fence x<\($0.max.x) y<\($0.max.y)" } ?? "no fence"

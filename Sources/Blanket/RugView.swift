@@ -6,10 +6,13 @@ import simd
 /// Transparent SceneKit view that renders the rug and drives the cloth simulation.
 final class RugView: SCNView, SCNSceneRendererDelegate {
     private struct Input {
-        var grabIndex: Int?
+        var grabIndices: [Int] = []
+        var grabOffsets: [SIMD3<Float>] = []
+        var grabGeneration = 0          // bumps on every new grab so the sim re-grabs
         var target = SIMD3<Float>(0, 0, 0)
         var releaseVelocity: SIMD3<Float>?
         var wantsReset = false
+        var isGrabbing: Bool { !grabIndices.isEmpty }
     }
 
     private let sim: ClothSimulation
@@ -50,9 +53,18 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
     private var lastDragPoint = SIMD2<Float>(0, 0)
     private var lastDragTime: TimeInterval = 0
     private var dragVelocity = SIMD2<Float>(0, 0)
+    private var currentLift: Float = 0
+    private var appliedGeneration = 0
 
-    /// How high a grabbed point is lifted off the desk, in points.
+    /// Base height a grabbed point is lifted off the desk, in points. A fast drag lifts higher,
+    /// a slow one keeps the rug low so it slides instead of folding.
     var liftHeight: Float = 42
+    /// Radius of an Option-drag wide grab, in grid spacings.
+    var wideGrabRadius: Float = 3.2
+
+    private func liftFor(speed: Float) -> Float {
+        min(max(liftHeight * 0.5 + speed * 0.035, liftHeight * 0.5), liftHeight * 1.8)
+    }
     /// Light travel direction; also used to project the fake floor shadow.
     private let lightDirection = simd_normalize(SIMD3<Float>(0.28, -0.22, -1))
 
@@ -68,6 +80,9 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
         let origin = SIMD2<Float>((W - rugW) / 2, (H - Float(rows - 1) * spacing) / 2)
 
         sim = ClothSimulation(cols: cols, rows: rows, spacing: spacing, origin: origin)
+        // Keep at least a hand's width of rug on screen.
+        let fence: Float = 80
+        sim.bounds = (SIMD2<Float>(-rugW + fence, -Float(rows - 1) * spacing + fence), SIMD2<Float>(W - fence, H - fence))
         clothGeo = ClothGeometry(cols: cols, rows: rows)
         fringeGeo = FringeGeometry(cols: cols, rows: rows, length: spacing * 1.7)
         rugMaterial = RugMaterial.makeRug(rugAspect: CGFloat(rugW / rugH))
@@ -196,7 +211,7 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self, !self.isDragging else { return }
             self.inputLock.lock()
-            let busy = self.input.grabIndex != nil || self.input.wantsReset
+            let busy = self.input.isGrabbing || self.input.wantsReset
             self.inputLock.unlock()
             if !busy { self.isPlaying = false }
         }
@@ -205,7 +220,8 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
     func reset() {
         inputLock.lock()
         input.wantsReset = true
-        input.grabIndex = nil
+        input.grabIndices = []
+        input.grabOffsets = []
         inputLock.unlock()
         isDragging = false
         resume()
@@ -227,24 +243,50 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
         let q = SIMD2<Float>(Float(p.x), Float(p.y))
+        let wide = event.modifierFlags.contains(.option)
+        guard beginGrab(at: q, wide: wide, keepOffset: true) else { return }
+        lastDragTime = event.timestamp
+        NSCursor.closedHand.push()
+    }
+
+    /// Picks the particle(s) under `q` and starts a grab. Returns false if there is no fabric there.
+    @discardableResult
+    private func beginGrab(at q: SIMD2<Float>, wide: Bool, keepOffset: Bool) -> Bool {
         inputLock.lock()
         let snap = snapshot
         inputLock.unlock()
-        guard let k = ClothSimulation.nearestParticle(to: q, positions: snap, maxDistance: sim.spacing * 1.6) else { return }
-        let particle = snap[k]
-        grabOffset = SIMD2(particle.x, particle.y) - q
+        let pickRadius = sim.spacing * (wide ? 3 : 1.6)
+        guard let center = ClothSimulation.nearestParticle(to: q, positions: snap, maxDistance: pickRadius) else { return false }
+        let c = snap[center]
+        grabOffset = keepOffset ? SIMD2(c.x, c.y) - q : .zero
         isDragging = true
         lastDragPoint = q
-        lastDragTime = event.timestamp
         dragVelocity = .zero
-        let target = SIMD3<Float>(q.x + grabOffset.x, q.y + grabOffset.y, sim.thickness + liftHeight)
+        currentLift = liftFor(speed: 0)
+
+        var indices = [center]
+        var offsets = [SIMD3<Float>(0, 0, 0)]
+        if wide {
+            let r = sim.spacing * wideGrabRadius
+            indices = ClothSimulation.particles(within: r, of: center, positions: snap, layerTolerance: sim.thickness * 2)
+            offsets = indices.map { k in
+                let d = snap[k] - c
+                let dist = (d.x * d.x + d.y * d.y).squareRoot()
+                let dome = max(0, 1 - dist / r)
+                // Rest offset in XY (keeps the patch rigid), lift tapering to the rim.
+                return SIMD3<Float>(d.x, d.y, -(1 - dome) * currentLift * 0.8)
+            }
+        }
+        let target = SIMD3<Float>(q.x + grabOffset.x, q.y + grabOffset.y, sim.thickness + currentLift)
         inputLock.lock()
-        input.grabIndex = k
+        input.grabIndices = indices
+        input.grabOffsets = offsets
+        input.grabGeneration += 1
         input.target = target
         input.releaseVelocity = nil
         inputLock.unlock()
         resume()
-        NSCursor.closedHand.push()
+        return true
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -256,8 +298,10 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
         dragVelocity = dragVelocity * 0.6 + v * 0.4
         lastDragPoint = q
         lastDragTime = event.timestamp
+        let speed = simd_length(dragVelocity)
+        currentLift = currentLift * 0.7 + liftFor(speed: speed) * 0.3
         inputLock.lock()
-        input.target = SIMD3<Float>(q.x + grabOffset.x, q.y + grabOffset.y, sim.thickness + liftHeight)
+        input.target = SIMD3<Float>(q.x + grabOffset.x, q.y + grabOffset.y, sim.thickness + currentLift)
         inputLock.unlock()
     }
 
@@ -268,7 +312,8 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
         // Stale velocity if the mouse paused before release.
         if event.timestamp - lastDragTime > 0.08 { dragVelocity = .zero }
         inputLock.lock()
-        input.grabIndex = nil
+        input.grabIndices = []
+        input.grabOffsets = []
         input.releaseVelocity = SIMD3<Float>(dragVelocity.x, dragVelocity.y, 0)
         inputLock.unlock()
     }
@@ -277,30 +322,48 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
 
     var debugIsAsleep: Bool { sim.isAsleep }
 
-    func debugBeginGrab(at q: SIMD2<Float>) {
+    /// Last published position of the particle at grid coordinates (i, j).
+    func debugParticlePosition(i: Int, j: Int) -> SIMD3<Float> {
         inputLock.lock()
         let snap = snapshot
         inputLock.unlock()
-        guard let k = ClothSimulation.nearestParticle(to: q, positions: snap, maxDistance: sim.spacing * 3) else { return }
-        grabOffset = .zero
-        isDragging = true
-        inputLock.lock()
-        input.grabIndex = k
-        input.target = SIMD3<Float>(q.x, q.y, sim.thickness + liftHeight)
-        inputLock.unlock()
-        resume()
+        let k = j * sim.cols + i
+        return k >= 0 && k < snap.count ? snap[k] : .zero
     }
 
-    func debugMoveGrab(to q: SIMD2<Float>) {
+    var debugGrid: (cols: Int, rows: Int) { (sim.cols, sim.rows) }
+
+    /// Stretch ratio between the grabbed particle and the particle `cells` steps toward the rug
+    /// centre along its row: 1.0 means inextensible, 1.3 means the rug stretched 30 % like rubber.
+    func debugStretch(cells: Int) -> Float {
         inputLock.lock()
-        input.target = SIMD3<Float>(q.x, q.y, sim.thickness + liftHeight)
+        let snap = snapshot
+        let k = input.grabIndices.first
+        inputLock.unlock()
+        guard let k, snap.count == sim.count else { return 0 }
+        let i = k % sim.cols, j = k / sim.cols
+        let dir = i < sim.cols / 2 ? 1 : -1
+        let i2 = min(max(i + dir * cells, 0), sim.cols - 1)
+        let d = simd_length(snap[j * sim.cols + i2] - snap[k])
+        return d / (Float(abs(i2 - i)) * sim.spacing)
+    }
+
+    func debugBeginGrab(at q: SIMD2<Float>, wide: Bool = false) {
+        beginGrab(at: q, wide: wide, keepOffset: false)
+    }
+
+    func debugMoveGrab(to q: SIMD2<Float>, speed: Float = 600) {
+        currentLift = currentLift * 0.7 + liftFor(speed: speed) * 0.3
+        inputLock.lock()
+        input.target = SIMD3<Float>(q.x, q.y, sim.thickness + currentLift)
         inputLock.unlock()
     }
 
     func debugEndGrab(velocity: SIMD2<Float>) {
         isDragging = false
         inputLock.lock()
-        input.grabIndex = nil
+        input.grabIndices = []
+        input.grabOffsets = []
         input.releaseVelocity = SIMD3<Float>(velocity.x, velocity.y, 0)
         inputLock.unlock()
     }
@@ -320,9 +383,14 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
 
         if inp.wantsReset { sim.reset() }
 
-        if let k = inp.grabIndex {
-            if sim.grabbedIndex != k { sim.grab(index: k, target: inp.target) } else { sim.moveGrab(to: inp.target) }
-        } else if sim.grabbedIndex != nil {
+        if inp.isGrabbing {
+            if appliedGeneration != inp.grabGeneration {
+                appliedGeneration = inp.grabGeneration
+                sim.grab(indices: inp.grabIndices, offsets: inp.grabOffsets, target: inp.target)
+            } else {
+                sim.moveGrab(to: inp.target)
+            }
+        } else if sim.isGrabbing {
             sim.release(velocity: inp.releaseVelocity ?? .zero, dt: dt / Float(sim.substeps))
         }
 

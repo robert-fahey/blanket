@@ -10,6 +10,11 @@ final class ClothSimulation {
         var stiffness: Float
     }
 
+    struct Grab {
+        var index: Int
+        var offset: SIMD3<Float>
+    }
+
     let cols: Int
     let rows: Int
     let spacing: Float
@@ -27,16 +32,25 @@ final class ClothSimulation {
     var gravity: Float = 3500          // points / s²
     var airDamping: Float = 0.995      // per substep
     var floorFriction: Float = 0.16    // fraction of tangential motion removed per contact substep
-    var substeps = 6
-    var iterations = 2
-    var grabFollow: Float = 0.45       // how quickly the grabbed point chases its target per substep
+    var substeps = 8
+    var iterations = 1
+    var grabFollow: Float = 0.45       // how quickly grabbed points chase their targets per substep
     var sleepThreshold: Float = 0.015  // max per-substep displacement under which the cloth sleeps
+    var layerSeparation: Float { thickness * 1.5 }
+    /// Particles are kept inside this XY rectangle so the rug can never be dragged out of reach.
+    var bounds: (min: SIMD2<Float>, max: SIMD2<Float>)?
 
     private(set) var isAsleep = false
-    private(set) var grabbedIndex: Int?
+    private(set) var grabs: [Grab] = []
     private var grabTarget: SIMD3<Float> = .zero
+    private var maxZ: Float = 0
+
+    // Spatial hash scratch space for layer stacking
+    private var cellHead: [Int32] = []
+    private var cellNext: [Int32]
 
     var count: Int { cols * rows }
+    var isGrabbing: Bool { !grabs.isEmpty }
 
     init(cols: Int, rows: Int, spacing: Float, origin: SIMD2<Float>) {
         self.cols = cols
@@ -47,6 +61,7 @@ final class ClothSimulation {
         pos = Array(repeating: .zero, count: n)
         prev = Array(repeating: .zero, count: n)
         invMass = Array(repeating: 1, count: n)
+        cellNext = Array(repeating: -1, count: n)
         buildConstraints()
         reset()
     }
@@ -63,6 +78,16 @@ final class ClothSimulation {
                 a: Int32(index(i0, j0)), b: Int32(index(i1, j1)),
                 rest: (dx * dx + dy * dy).squareRoot(), stiffness: stiffness
             ))
+        }
+        // Long-range "cables" first: they carry a yank across the rug in a few sweeps
+        // instead of letting it stretch like rubber.
+        for skip in [8, 4] {
+            for j in stride(from: 0, to: rows, by: skip) {
+                for i in stride(from: 0, to: cols, by: skip) {
+                    add(i, j, i + skip, j, 0.8)
+                    add(i, j, i, j + skip, 0.8)
+                }
+            }
         }
         // Structural
         for j in 0..<rows {
@@ -97,15 +122,28 @@ final class ClothSimulation {
             }
         }
         for k in 0..<count { invMass[k] = 1 }
-        grabbedIndex = nil
+        grabs = []
         isAsleep = false
     }
 
-    func grab(index k: Int, target: SIMD3<Float>) {
-        guard k >= 0, k < count else { return }
-        if let old = grabbedIndex { invMass[old] = 1 }
-        grabbedIndex = k
-        invMass[k] = 0
+    /// Load externally saved positions (same grid dimensions required).
+    func load(positions: [SIMD3<Float>]) {
+        guard positions.count == count else { return }
+        pos = positions
+        prev = positions
+        for k in 0..<count { invMass[k] = 1 }
+        grabs = []
+        isAsleep = false
+    }
+
+    /// Grab one or more particles. Each grabbed particle chases `target + offset`.
+    func grab(indices: [Int], offsets: [SIMD3<Float>], target: SIMD3<Float>) {
+        for g in grabs { invMass[g.index] = 1 }
+        grabs = []
+        for (k, off) in zip(indices, offsets) where k >= 0 && k < count {
+            grabs.append(Grab(index: k, offset: off))
+            invMass[k] = 0
+        }
         grabTarget = target
         wake()
     }
@@ -115,10 +153,12 @@ final class ClothSimulation {
     }
 
     func release(velocity: SIMD3<Float>, dt: Float) {
-        guard let k = grabbedIndex else { return }
-        invMass[k] = 1
-        prev[k] = pos[k] - velocity * dt
-        grabbedIndex = nil
+        guard isGrabbing else { return }
+        for g in grabs {
+            invMass[g.index] = 1
+            prev[g.index] = pos[g.index] - velocity * dt
+        }
+        grabs = []
         wake()
     }
 
@@ -132,12 +172,13 @@ final class ClothSimulation {
     /// Advance the simulation by `dt` seconds (clamped). Returns true if positions changed.
     @discardableResult
     func step(dt rawDt: Float) -> Bool {
-        if isAsleep && grabbedIndex == nil { return false }
+        if isAsleep && !isGrabbing { return false }
         let dt = min(max(rawDt, 1.0 / 240.0), 1.0 / 30.0)
         let h = dt / Float(substeps)
         let g = SIMD3<Float>(0, 0, -gravity * h * h)
         let floorZ = thickness
         var maxMove: Float = 0
+        var highest: Float = 0
 
         pos.withUnsafeMutableBufferPointer { p in
             prev.withUnsafeMutableBufferPointer { q in
@@ -151,12 +192,12 @@ final class ClothSimulation {
                                 q[k] = x
                                 p[k] = x + v + g
                             }
-                            // Grabbed point chases its target (slight lag = weight)
-                            if let gk = grabbedIndex {
-                                let x = p[gk]
-                                let nx = x + (grabTarget - x) * grabFollow
-                                q[gk] = x
-                                p[gk] = nx
+                            // Grabbed points chase their targets (slight lag = weight)
+                            for gr in grabs {
+                                let x = p[gr.index]
+                                let nx = x + (grabTarget + gr.offset - x) * grabFollow
+                                q[gr.index] = x
+                                p[gr.index] = nx
                             }
                             // Solve constraints, alternating sweep direction so corrections
                             // propagate equally fast both ways across the grid.
@@ -177,9 +218,14 @@ final class ClothSimulation {
                                     p[b] -= corr * wb
                                 }
                             }
-                            // Floor collision + friction
+                            // Floor collision + friction, and the screen fence
                             for k in 0..<p.count where w[k] > 0 {
                                 var x = p[k]
+                                if let b = bounds {
+                                    if x.x < b.min.x { x.x = b.min.x } else if x.x > b.max.x { x.x = b.max.x }
+                                    if x.y < b.min.y { x.y = b.min.y } else if x.y > b.max.y { x.y = b.max.y }
+                                    p[k] = x
+                                }
                                 if x.z < floorZ {
                                     x.z = floorZ
                                     // Coulomb-ish: remove a fraction of tangential motion while touching.
@@ -194,6 +240,7 @@ final class ClothSimulation {
                                 for k in 0..<p.count {
                                     let m = simd_length_squared(p[k] - q[k])
                                     if m > maxMove { maxMove = m }
+                                    if p[k].z > highest { highest = p[k].z }
                                 }
                             }
                         }
@@ -201,12 +248,100 @@ final class ClothSimulation {
                 }
             }
         }
+        maxZ = highest
 
-        if grabbedIndex == nil && maxMove.squareRoot() < sleepThreshold {
+        if highest > thickness + 0.5 {
+            stackLayers()
+        }
+
+        if !isGrabbing && maxMove.squareRoot() < sleepThreshold {
             isAsleep = true
             for k in 0..<count { prev[k] = pos[k] }
         }
         return true
+    }
+
+    /// Approximate self-collision: particles that overlap in XY but are far apart on the grid
+    /// are kept at least one rug thickness apart vertically, so folded layers stack instead of
+    /// passing through each other. Pure positional correction (prev moves too), so it adds no velocity.
+    private func stackLayers() {
+        let n = count
+        var minX = Float.greatestFiniteMagnitude, minY = minX
+        var maxX = -Float.greatestFiniteMagnitude, maxY = maxX
+        for v in pos {
+            if v.x < minX { minX = v.x }; if v.x > maxX { maxX = v.x }
+            if v.y < minY { minY = v.y }; if v.y > maxY { maxY = v.y }
+        }
+        let cell = spacing
+        let nx = Int((maxX - minX) / cell) + 2
+        let ny = Int((maxY - minY) / cell) + 2
+        let cellCount = nx * ny
+        if cellHead.count < cellCount { cellHead = Array(repeating: -1, count: cellCount) }
+        for c in 0..<cellCount { cellHead[c] = -1 }
+
+        @inline(__always) func cellOf(_ v: SIMD3<Float>) -> (Int, Int) {
+            (Int((v.x - minX) / cell), Int((v.y - minY) / cell))
+        }
+        for k in 0..<n {
+            let (cx, cy) = cellOf(pos[k])
+            let c = cy * nx + cx
+            cellNext[k] = cellHead[c]
+            cellHead[c] = Int32(k)
+        }
+
+        let sep = layerSeparation
+        let touchSq = (0.8 * spacing) * (0.8 * spacing)
+        let floorZ = thickness
+        pos.withUnsafeMutableBufferPointer { p in
+            prev.withUnsafeMutableBufferPointer { q in
+                for a in 0..<n {
+                    let pa = p[a]
+                    let ia = a % cols, ja = a / cols
+                    let (cx, cy) = cellOf(pa)
+                    for oy in -1...1 {
+                        let yy = cy + oy
+                        if yy < 0 || yy >= ny { continue }
+                        for ox in -1...1 {
+                            let xx = cx + ox
+                            if xx < 0 || xx >= nx { continue }
+                            var b = Int(cellHead[yy * nx + xx])
+                            while b >= 0 {
+                                defer { b = Int(cellNext[b]) }
+                                if b <= a { continue }
+                                let ib = b % cols, jb = b / cols
+                                if abs(ia - ib) <= 2 && abs(ja - jb) <= 2 { continue }
+                                let pb = p[b]
+                                let dx = pa.x - pb.x, dy = pa.y - pb.y
+                                if dx * dx + dy * dy > touchSq { continue }
+                                let dz = p[a].z - pb.z
+                                let adz = abs(dz)
+                                if adz >= sep { continue }
+                                // Neither is lifted: flat rug resting on itself is impossible; skip.
+                                if p[a].z <= floorZ + 0.01 && pb.z <= floorZ + 0.01 { continue }
+                                let push = sep - adz
+                                let wa = invMass[a], wb = invMass[b]
+                                let wsum = wa + wb
+                                if wsum == 0 { continue }
+                                let upper = dz >= 0 ? a : b
+                                let lower = dz >= 0 ? b : a
+                                let wu = invMass[upper] / wsum, wl = invMass[lower] / wsum
+                                p[upper].z += push * wu
+                                q[upper].z += push * wu
+                                var lz = p[lower].z - push * wl
+                                if lz < floorZ {
+                                    let deficit = floorZ - lz
+                                    lz = floorZ
+                                    p[upper].z += deficit * (wu > 0 ? 1 : 0)
+                                    q[upper].z += deficit * (wu > 0 ? 1 : 0)
+                                }
+                                q[lower].z += lz - p[lower].z
+                                p[lower].z = lz
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Smooth per-vertex normals via central differences across the grid.
@@ -235,7 +370,6 @@ final class ClothSimulation {
     /// True if the 2D point lies inside any quad of the given cloth positions.
     static func contains(point q: SIMD2<Float>, positions p: [SIMD3<Float>], cols: Int, rows: Int) -> Bool {
         guard p.count == cols * rows else { return false }
-        // Quick bounding-box reject
         var minX = Float.greatestFiniteMagnitude, minY = minX
         var maxX = -Float.greatestFiniteMagnitude, maxY = maxX
         for v in p {
@@ -271,9 +405,23 @@ final class ClothSimulation {
             let dx = v.x - q.x, dy = v.y - q.y
             let d2 = dx * dx + dy * dy
             if d2 > maxSq { continue }
-            let score = d2 - v.z * 0.5   // small bonus for lifted fabric
+            let score = d2 - v.z * 0.5
             if score < bestScore { bestScore = score; best = k }
         }
         return best
+    }
+
+    /// Particles within `radius` (in XY) of a centre particle that are also close to it in height,
+    /// so a wide grab picks one layer of a fold, not both.
+    static func particles(within radius: Float, of center: Int, positions p: [SIMD3<Float>], layerTolerance: Float) -> [Int] {
+        guard center >= 0, center < p.count else { return [] }
+        let c = p[center]
+        let r2 = radius * radius
+        var out: [Int] = []
+        for (k, v) in p.enumerated() {
+            let dx = v.x - c.x, dy = v.y - c.y
+            if dx * dx + dy * dy <= r2 && abs(v.z - c.z) <= layerTolerance { out.append(k) }
+        }
+        return out
     }
 }

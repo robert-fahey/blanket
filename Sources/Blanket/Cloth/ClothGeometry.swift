@@ -7,7 +7,7 @@ final class ClothGeometry {
     let rows: Int
     private let element: SCNGeometryElement
     private let uvSource: SCNGeometrySource
-    private var normals: [SIMD3<Float>] = []
+    private(set) var normals: [SIMD3<Float>] = []
 
     init(cols: Int, rows: Int) {
         self.cols = cols

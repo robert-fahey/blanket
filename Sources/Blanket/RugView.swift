@@ -18,7 +18,10 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
     private let sim: ClothSimulation
     private let clothGeo: ClothGeometry
     private let fringeGeo: FringeGeometry
+    private let edgeGeo: EdgeGeometry
     private let rugMaterial: SCNMaterial
+    private let undersideMaterial: SCNMaterial
+    private let selvedgeMaterial = RugMaterial.makeSelvedge()
     private let shadowMaterial = RugMaterial.makeShadow()
     private let fringeMaterial = RugMaterial.makeFringe()
     private lazy var fringeShadowMaterial: SCNMaterial = {
@@ -36,6 +39,8 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
     private(set) var profileFrames = 0
 
     private let clothNode = SCNNode()
+    private let backNode = SCNNode()
+    private let edgeNode = SCNNode()
     private let shadowNode = SCNNode()
     private let fringeShadowNode = SCNNode()
     private let fringeNode = SCNNode()
@@ -67,6 +72,9 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
     }
     /// Light travel direction; also used to project the fake floor shadow.
     private let lightDirection = simd_normalize(SIMD3<Float>(0.28, -0.22, -1))
+    /// Orthographic top-down camera instead of the mild perspective one (debugging aid).
+    static var useFlatCamera = ProcessInfo.processInfo.environment["BLANKET_FLAT_CAMERA"] != nil
+    private let perspectiveFOV: Float = 14
 
     override init(frame: NSRect, options: [String: Any]? = nil) {
         // Rug ~1.45:1, covering most of the screen.
@@ -85,7 +93,10 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
         sim.bounds = (SIMD2<Float>(-rugW + fence, -Float(rows - 1) * spacing + fence), SIMD2<Float>(W - fence, H - fence))
         clothGeo = ClothGeometry(cols: cols, rows: rows)
         fringeGeo = FringeGeometry(cols: cols, rows: rows, length: spacing * 1.7)
-        rugMaterial = RugMaterial.makeRug(rugAspect: CGFloat(rugW / rugH))
+        edgeGeo = EdgeGeometry(cols: cols, rows: rows, depth: sim.thickness)
+        let top = RugTextureGenerator.makeRugImage()
+        rugMaterial = RugMaterial.makeRug(image: top, rugAspect: CGFloat(rugW / rugH))
+        undersideMaterial = RugMaterial.makeUnderside(image: RugTextureGenerator.makeUndersideImage(from: top), rugAspect: CGFloat(rugW / rugH))
 
         super.init(frame: frame, options: options)
         snapshot = sim.pos
@@ -116,10 +127,17 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
         self.scene = scene
 
         let camera = SCNCamera()
-        camera.usesOrthographicProjection = true
-        camera.zNear = 1
-        camera.zFar = 4000
+        camera.usesOrthographicProjection = RugView.useFlatCamera
+        camera.projectionDirection = .vertical
+        camera.fieldOfView = CGFloat(perspectiveFOV)
+        camera.zNear = 10
+        camera.zFar = 12000
         camera.wantsHDR = false
+        // Contact shading where folded layers meet.
+        camera.screenSpaceAmbientOcclusionIntensity = 1.1
+        camera.screenSpaceAmbientOcclusionRadius = 18
+        camera.screenSpaceAmbientOcclusionBias = 1
+        camera.screenSpaceAmbientOcclusionDepthThreshold = 60
         cameraNode.camera = camera
         scene.rootNode.addChildNode(cameraNode)
         pointOfView = cameraNode
@@ -130,8 +148,8 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
         key.color = NSColor(calibratedRed: 1.0, green: 0.97, blue: 0.92, alpha: 1)
         key.castsShadow = true
         key.shadowMode = .forward
-        key.shadowSampleCount = 8
-        key.shadowRadius = 4
+        key.shadowSampleCount = 16
+        key.shadowRadius = 6
         key.shadowBias = 2
         key.shadowMapSize = CGSize(width: 2048, height: 2048)
         key.orthographicScale = 1600
@@ -154,11 +172,15 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
         fringeShadowNode.castsShadow = false
         fringeNode.renderingOrder = -5
         fringeNode.castsShadow = false
+        backNode.renderingOrder = -1
+        edgeNode.renderingOrder = -1
         clothNode.renderingOrder = 0
 
         scene.rootNode.addChildNode(shadowNode)
         scene.rootNode.addChildNode(fringeShadowNode)
         scene.rootNode.addChildNode(fringeNode)
+        scene.rootNode.addChildNode(edgeNode)
+        scene.rootNode.addChildNode(backNode)
         scene.rootNode.addChildNode(clothNode)
 
         // Shear-project everything onto the desk (z ≈ 0) along the light direction.
@@ -176,7 +198,9 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
 
     func viewportChanged(to size: CGSize) {
         let W = Float(size.width), H = Float(size.height)
-        cameraNode.simdPosition = SIMD3<Float>(W / 2, H / 2, 2000)
+        // Distance at which the desk plane (z = 0) maps 1:1 onto screen points.
+        let distance = RugView.useFlatCamera ? 2000 : (H / 2) / tan(perspectiveFOV * .pi / 360)
+        cameraNode.simdPosition = SIMD3<Float>(W / 2, H / 2, distance)
         cameraNode.simdOrientation = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 0, 1))
         cameraNode.camera?.orthographicScale = Double(H / 2)
         keyLightNode.simdPosition = SIMD3<Float>(W / 2, H / 2, 1500)
@@ -186,6 +210,10 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
     private func rebuildGeometry() {
         let geo = clothGeo.makeGeometry(from: sim, material: rugMaterial)
         clothNode.geometry = geo
+        let backGeo = geo.copy() as! SCNGeometry
+        backGeo.materials = [undersideMaterial]
+        backNode.geometry = backGeo
+        edgeNode.geometry = edgeGeo.makeGeometry(from: sim, normals: clothGeo.normals, material: selvedgeMaterial)
         let shadowGeo = geo.copy() as! SCNGeometry
         shadowGeo.materials = [shadowMaterial]
         shadowNode.geometry = shadowGeo

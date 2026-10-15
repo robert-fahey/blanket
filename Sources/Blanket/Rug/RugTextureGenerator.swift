@@ -369,6 +369,30 @@ enum RugTextureGenerator {
         )
     }
 
+    /// The back of the rug: the same pattern seen through a pale, knotted weave.
+    static func makeUndersideImage(from top: CGImage) -> CGImage {
+        let W = top.width, H = top.height
+        let cs = CGColorSpace(name: CGColorSpace.sRGB)!
+        let ctx = CGContext(
+            data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0,
+            space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )!
+        let rect = CGRect(x: 0, y: 0, width: W, height: H)
+        ctx.draw(top, in: rect)
+        ctx.setFillColor(CGColor(srgbRed: 0.90, green: 0.85, blue: 0.74, alpha: 0.55))
+        ctx.fill(rect)
+        // Knot grid: fine lines in both directions.
+        ctx.setStrokeColor(CGColor(srgbRed: 0.25, green: 0.2, blue: 0.18, alpha: 0.12))
+        ctx.setLineWidth(1)
+        let step: CGFloat = 6
+        var x: CGFloat = 0
+        while x < CGFloat(W) { ctx.move(to: CGPoint(x: x, y: 0)); ctx.addLine(to: CGPoint(x: x, y: CGFloat(H))); x += step }
+        var y: CGFloat = 0
+        while y < CGFloat(H) { ctx.move(to: CGPoint(x: 0, y: y)); ctx.addLine(to: CGPoint(x: CGFloat(W), y: y)); y += step }
+        ctx.strokePath()
+        return ctx.makeImage()!
+    }
+
     /// Tassel texture: a few cream strands with a knot at the top (v = 0), transparent between.
     static func makeFringeImage(size: Int = 128) -> CGImage {
         let cs = CGColorSpace(name: CGColorSpace.sRGB)!

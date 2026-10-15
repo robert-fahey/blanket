@@ -25,7 +25,7 @@ final class ClothSimulation {
     let rows: Int
     let spacing: Float
     /// Height of the rug's underside above the desk. Keeps it from z-fighting the floor.
-    let thickness: Float = 4
+    let thickness: Float = 8
 
     private(set) var pos: [SIMD3<Float>]
     private var prev: [SIMD3<Float>]

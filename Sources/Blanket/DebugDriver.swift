@@ -20,21 +20,35 @@ final class DebugDriver {
     }
 
     func start() {
+        // BLANKET_SNAPSHOT_MODE=rest: just capture whatever state was restored, then quit.
+        if ProcessInfo.processInfo.environment["BLANKET_SNAPSHOT_MODE"] == "rest" {
+            schedule(1.0) { self.snapshot("restored") }
+            for t in stride(from: 2.0, through: 6.0, by: 1.0) {
+                schedule(t) { self.log(String(format: "t=%.0fs asleep=%d maxMove=%.4f", t, self.view.debugIsAsleep ? 1 : 0, self.view.debugMaxMove)) }
+            }
+            schedule(1.3) { self.log(self.view.debugTopMovers(10)) }
+            schedule(6.2) { NSApp.terminate(nil) }
+            return
+        }
+        schedule(0.1) { self.view.reset() }
         let size = view.bounds.size
         let W = Float(size.width), H = Float(size.height)
         // Grab just inside the rug's lower-right corner and pull it up-left across the screen.
         let grid = view.debugGrid
-        let corner = view.debugParticlePosition(i: grid.cols - 2, j: 1)
-        let start = SIMD2<Float>(corner.x, corner.y)
+        // Corner position is read after the reset above has been applied.
+        var start = SIMD2<Float>(0, 0)
         let end = SIMD2<Float>(W * 0.45, H * 0.55)
 
         schedule(1.0) { self.snapshot("1-rest") }
-        schedule(1.2) { self.view.debugBeginGrab(at: start) }
+        schedule(1.2) {
+            let corner = self.view.debugParticlePosition(i: grid.cols - 2, j: 1)
+            start = SIMD2<Float>(corner.x, corner.y)
+            self.view.debugBeginGrab(at: start)
+        }
         let steps = 45
         for s in 1...steps {
             let f = Float(s) / Float(steps)
-            let p = start + (end - start) * f
-            schedule(1.2 + 1.5 * Double(f)) { self.view.debugMoveGrab(to: p) }
+            schedule(1.2 + 1.5 * Double(f)) { self.view.debugMoveGrab(to: start + (end - start) * f) }
         }
         schedule(1.5) {
             self.log(String(format: "stretch at 12 cells during the yank: %.3f (1.0 = inextensible)", self.view.debugStretch(cells: 12)))
@@ -85,6 +99,6 @@ final class DebugDriver {
               let rep = NSBitmapImageRep(data: tiff),
               let png = rep.representation(using: .png, properties: [:]) else { return }
         try? png.write(to: dir.appendingPathComponent("\(name).png"))
-        log("snapshot \(name) asleep=\(view.debugIsAsleep)")
+        log(String(format: "snapshot %@ asleep=%d maxMove=%.4f", name, view.debugIsAsleep ? 1 : 0, view.debugMaxMove))
     }
 }

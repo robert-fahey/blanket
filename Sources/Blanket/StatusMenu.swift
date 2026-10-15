@@ -7,10 +7,13 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     private let styleItems: [NSMenuItem]
     private let sizeItems: [NSMenuItem]
     private let builtInItem: NSMenuItem
+    private let launchItem: NSMenuItem
 
     var onReset: (() -> Void)?
     var onToggle: (() -> Void)?
     var onPickImage: (() -> Void)?
+    var onLaunchAtLoginToggle: (() -> Void)?
+    var launchAtLoginState: (() -> (enabled: Bool, available: Bool))?
 
     override init() {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -18,6 +21,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         styleItems = RugStyle.allCases.map { NSMenuItem(title: $0.displayName, action: nil, keyEquivalent: "") }
         sizeItems = RugSize.allCases.map { NSMenuItem(title: $0.displayName, action: nil, keyEquivalent: "") }
         builtInItem = NSMenuItem(title: "Use Built-in Rug", action: nil, keyEquivalent: "")
+        launchItem = NSMenuItem(title: "Launch at Login", action: nil, keyEquivalent: "")
         super.init()
 
         if let image = NSImage(systemSymbolName: "rectangle.inset.filled", accessibilityDescription: "Blanket") {
@@ -28,6 +32,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         }
 
         let reset = NSMenuItem(title: "Reset Rug", action: #selector(resetTapped), keyEquivalent: "r")
+        reset.keyEquivalentModifierMask = [.control, .option, .command]
         reset.target = self
         menu.addItem(reset)
         toggleItem.action = #selector(toggleTapped)
@@ -65,6 +70,10 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(sizeItem)
 
         menu.addItem(.separator())
+        launchItem.action = #selector(launchTapped)
+        launchItem.target = self
+        menu.addItem(launchItem)
+        menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit Blanket", action: #selector(quitTapped), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
@@ -87,11 +96,16 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         for (size, mi) in zip(RugSize.allCases, sizeItems) {
             mi.state = size == Settings.rugSize ? .on : .off
         }
+        let login = launchAtLoginState?() ?? (enabled: false, available: false)
+        launchItem.isEnabled = login.available
+        launchItem.state = login.enabled ? .on : .off
+        launchItem.toolTip = login.available ? nil : "Available when running from Blanket.app"
     }
 
     @objc private func resetTapped() { onReset?() }
     @objc private func toggleTapped() { onToggle?() }
     @objc private func pickImageTapped() { onPickImage?() }
+    @objc private func launchTapped() { onLaunchAtLoginToggle?() }
     @objc private func quitTapped() { NSApp.terminate(nil) }
 
     @objc private func styleTapped(_ sender: NSMenuItem) {

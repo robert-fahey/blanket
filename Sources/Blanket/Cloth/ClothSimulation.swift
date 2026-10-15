@@ -1,3 +1,4 @@
+import Foundation
 import simd
 
 /// Position-based-dynamics cloth lying on the z = 0 "desk" plane.
@@ -8,6 +9,8 @@ final class ClothSimulation {
         var b: Int32
         var rest: Float
         var stiffness: Float
+        /// Multiplier applied when the constraint is shorter than rest. 0 = goes slack like a rope.
+        var compression: Float
     }
 
     struct Grab {
@@ -35,7 +38,30 @@ final class ClothSimulation {
     var substeps = 8
     var iterations = 1
     var grabFollow: Float = 0.45       // how quickly grabbed points chase their targets per substep
-    var sleepThreshold: Float = 0.015  // max per-substep displacement under which the cloth sleeps
+    var sleepThreshold: Float = 0.03   // max per-substep displacement under which the cloth sleeps
+    var drowsyThreshold: Float = 0.12  // ... or under this for `drowsyFrames` frames in a row
+    var drowsyFrames = 45
+    private var drowsyCount = 0
+    private(set) var lastMaxMove: Float = 0
+    /// Fabric buckles rather than resisting in-plane compression: constraints push back on
+    /// compression with this fraction of their stretch stiffness.
+    var compressionStiffness: Float = 0.25
+    /// Compression corrections are capped per substep, so they act as gentle pressure rather than
+    /// a stiff spring that rings against the layer stacking in a tight fold.
+    var maxCompressionStep: Float = 0.1
+    // Macro-stillness: if the cloth's extent and centroid have not moved for a while, it is only
+    // vibrating in place (e.g. crumpled against the fence) and can sleep.
+    private var stillFrames = 0
+    private var lastExtent = SIMD4<Float>(0, 0, 0, 0)
+    private var lastCentroid = SIMD3<Float>(0, 0, 0)
+    var stillCheckInterval = 30
+    var stillChecksToSleep = 3
+    private var stillChecks = 0
+    /// Safety net: a cloth nobody is holding sleeps after this many frames no matter what.
+    /// A heap of fabric can "boil" indefinitely at sub-point amplitude otherwise.
+    var maxAwakeFrames = 300
+    /// Fraction of the required stacking separation applied per pass (relaxation).
+    var stackRelaxation: Float = 0.5
     var layerSeparation: Float { thickness * 1.5 }
     /// Particles are kept inside this XY rectangle so the rug can never be dragged out of reach.
     var bounds: (min: SIMD2<Float>, max: SIMD2<Float>)?
@@ -45,9 +71,14 @@ final class ClothSimulation {
     private var grabTarget: SIMD3<Float> = .zero
     private var maxZ: Float = 0
 
-    // Spatial hash scratch space for layer stacking
+    // Spatial hash and accumulation scratch space for layer stacking
     private var cellHead: [Int32] = []
     private var cellNext: [Int32]
+    private var stackDelta: [Float]
+    private var stackCount: [Int32]
+    private var stackDrag: [SIMD2<Float>]
+    /// Friction between stacked layers, as a fraction of relative tangential motion removed per contact.
+    var layerFriction: Float = 0.2
 
     var count: Int { cols * rows }
     var isGrabbing: Bool { !grabs.isEmpty }
@@ -62,6 +93,9 @@ final class ClothSimulation {
         prev = Array(repeating: .zero, count: n)
         invMass = Array(repeating: 1, count: n)
         cellNext = Array(repeating: -1, count: n)
+        stackDelta = Array(repeating: 0, count: n)
+        stackCount = Array(repeating: 0, count: n)
+        stackDrag = Array(repeating: .zero, count: n)
         buildConstraints()
         reset()
     }
@@ -70,13 +104,13 @@ final class ClothSimulation {
 
     private func buildConstraints() {
         constraints.removeAll(keepingCapacity: true)
-        func add(_ i0: Int, _ j0: Int, _ i1: Int, _ j1: Int, _ stiffness: Float) {
+        func add(_ i0: Int, _ j0: Int, _ i1: Int, _ j1: Int, _ stiffness: Float, compression: Float) {
             guard i1 >= 0, i1 < cols, j1 >= 0, j1 < rows else { return }
             let dx = Float(i1 - i0) * spacing
             let dy = Float(j1 - j0) * spacing
             constraints.append(Constraint(
                 a: Int32(index(i0, j0)), b: Int32(index(i1, j1)),
-                rest: (dx * dx + dy * dy).squareRoot(), stiffness: stiffness
+                rest: (dx * dx + dy * dy).squareRoot(), stiffness: stiffness, compression: compression
             ))
         }
         // Long-range "cables" first: they carry a yank across the rug in a few sweeps
@@ -84,30 +118,30 @@ final class ClothSimulation {
         for skip in [8, 4] {
             for j in stride(from: 0, to: rows, by: skip) {
                 for i in stride(from: 0, to: cols, by: skip) {
-                    add(i, j, i + skip, j, 0.8)
-                    add(i, j, i, j + skip, 0.8)
+                    add(i, j, i + skip, j, 0.8, compression: 0)        // ropes: slack when folded
+                    add(i, j, i, j + skip, 0.8, compression: 0)
                 }
             }
         }
         // Structural
         for j in 0..<rows {
             for i in 0..<cols {
-                add(i, j, i + 1, j, 1.0)
-                add(i, j, i, j + 1, 1.0)
+                add(i, j, i + 1, j, 1.0, compression: compressionStiffness)
+                add(i, j, i, j + 1, 1.0, compression: compressionStiffness)
             }
         }
         // Shear
         for j in 0..<rows {
             for i in 0..<cols {
-                add(i, j, i + 1, j + 1, 0.9)
-                add(i, j, i - 1, j + 1, 0.9)
+                add(i, j, i + 1, j + 1, 0.9, compression: compressionStiffness)
+                add(i, j, i - 1, j + 1, 0.9, compression: compressionStiffness)
             }
         }
         // Bend (a thick rug resists sharp folding)
         for j in 0..<rows {
             for i in 0..<cols {
-                add(i, j, i + 2, j, 0.35)
-                add(i, j, i, j + 2, 0.35)
+                add(i, j, i + 2, j, 0.35, compression: 1)              // bending stiffness works both ways
+                add(i, j, i, j + 2, 0.35, compression: 1)
             }
         }
     }
@@ -162,8 +196,11 @@ final class ClothSimulation {
         wake()
     }
 
+    static let logTransitions = ProcessInfo.processInfo.environment["BLANKET_LOG"] != nil || Bundle.main.bundleURL.pathExtension == "app"
+
     func wake() {
         if isAsleep {
+            if ClothSimulation.logTransitions { NSLog("Blanket: cloth awake") }
             isAsleep = false
             for k in 0..<count { prev[k] = pos[k] }
         }
@@ -213,7 +250,12 @@ final class ClothSimulation {
                                     let d = p[b] - p[a]
                                     let len = simd_length(d)
                                     if len < 1e-5 { continue }
-                                    let corr = d * ((len - c.rest) / len * c.stiffness / wsum)
+                                    var amount = (len - c.rest) * c.stiffness / wsum
+                                    if len < c.rest {
+                                        if c.compression == 0 { continue }
+                                        amount = max(amount * c.compression, -maxCompressionStep)
+                                    }
+                                    let corr = d * (amount / len)
                                     p[a] += corr * wa
                                     p[b] -= corr * wb
                                 }
@@ -236,6 +278,9 @@ final class ClothSimulation {
                                     p[k] = x
                                 }
                             }
+                            var lifted = false
+                            for k in 0..<p.count where p[k].z > floorZ + 0.5 { lifted = true; break }
+                            if lifted && (s & 1) == 1 { stackLayers(p, q, w) }
                             if s == substeps - 1 {
                                 for k in 0..<p.count {
                                     let m = simd_length_squared(p[k] - q[k])
@@ -249,26 +294,58 @@ final class ClothSimulation {
             }
         }
         maxZ = highest
+        let move = maxMove.squareRoot()
+        lastMaxMove = move
 
-        if highest > thickness + 0.5 {
-            stackLayers()
-        }
-
-        if !isGrabbing && maxMove.squareRoot() < sleepThreshold {
-            isAsleep = true
-            for k in 0..<count { prev[k] = pos[k] }
+        if !isGrabbing {
+            drowsyCount = move < drowsyThreshold ? drowsyCount + 1 : 0
+            stillFrames += 1
+            var macroStill = false
+            if stillFrames % stillCheckInterval == 0 {
+                var lo = SIMD2<Float>(Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude)
+                var hi = -lo
+                var sum = SIMD3<Float>(0, 0, 0)
+                for v in pos {
+                    lo = simd_min(lo, SIMD2(v.x, v.y)); hi = simd_max(hi, SIMD2(v.x, v.y)); sum += v
+                }
+                let extent = SIMD4<Float>(lo.x, lo.y, hi.x, hi.y)
+                let centroid = sum / Float(count)
+                let unchanged = simd_length(extent - lastExtent) < 1.0 && simd_length(centroid - lastCentroid) < 0.5
+                lastExtent = extent
+                lastCentroid = centroid
+                stillChecks = unchanged ? stillChecks + 1 : 0
+                macroStill = stillChecks >= stillChecksToSleep
+            }
+            let exhausted = stillFrames >= maxAwakeFrames
+            if move < sleepThreshold || drowsyCount >= drowsyFrames || macroStill || exhausted {
+                if ClothSimulation.logTransitions {
+                    NSLog("Blanket: cloth asleep (move %.3f, drowsy %d, still %d, exhausted %d)", move, drowsyCount >= drowsyFrames ? 1 : 0, macroStill ? 1 : 0, exhausted ? 1 : 0)
+                }
+                isAsleep = true
+                drowsyCount = 0
+                stillFrames = 0
+                stillChecks = 0
+                for k in 0..<count { prev[k] = pos[k] }
+            }
+        } else {
+            drowsyCount = 0
+            stillFrames = 0
+            stillChecks = 0
         }
         return true
     }
 
     /// Approximate self-collision: particles that overlap in XY but are far apart on the grid
     /// are kept at least one rug thickness apart vertically, so folded layers stack instead of
-    /// passing through each other. Pure positional correction (prev moves too), so it adds no velocity.
-    private func stackLayers() {
-        let n = count
+    /// passing through each other. Acts like a contact: the supported particle loses its vertical velocity.
+    private func stackLayers(_ p: UnsafeMutableBufferPointer<SIMD3<Float>>,
+                             _ q: UnsafeMutableBufferPointer<SIMD3<Float>>,
+                             _ w: UnsafeBufferPointer<Float>) {
+        let n = p.count
         var minX = Float.greatestFiniteMagnitude, minY = minX
         var maxX = -Float.greatestFiniteMagnitude, maxY = maxX
-        for v in pos {
+        for k in 0..<n {
+            let v = p[k]
             if v.x < minX { minX = v.x }; if v.x > maxX { maxX = v.x }
             if v.y < minY { minY = v.y }; if v.y > maxY { maxY = v.y }
         }
@@ -283,7 +360,7 @@ final class ClothSimulation {
             (Int((v.x - minX) / cell), Int((v.y - minY) / cell))
         }
         for k in 0..<n {
-            let (cx, cy) = cellOf(pos[k])
+            let (cx, cy) = cellOf(p[k])
             let c = cy * nx + cx
             cellNext[k] = cellHead[c]
             cellHead[c] = Int32(k)
@@ -292,56 +369,79 @@ final class ClothSimulation {
         let sep = layerSeparation
         let touchSq = (0.8 * spacing) * (0.8 * spacing)
         let floorZ = thickness
-        pos.withUnsafeMutableBufferPointer { p in
-            prev.withUnsafeMutableBufferPointer { q in
-                for a in 0..<n {
-                    let pa = p[a]
-                    let ia = a % cols, ja = a / cols
-                    let (cx, cy) = cellOf(pa)
-                    for oy in -1...1 {
-                        let yy = cy + oy
-                        if yy < 0 || yy >= ny { continue }
-                        for ox in -1...1 {
-                            let xx = cx + ox
-                            if xx < 0 || xx >= nx { continue }
-                            var b = Int(cellHead[yy * nx + xx])
-                            while b >= 0 {
-                                defer { b = Int(cellNext[b]) }
-                                if b <= a { continue }
-                                let ib = b % cols, jb = b / cols
-                                if abs(ia - ib) <= 2 && abs(ja - jb) <= 2 { continue }
-                                let pb = p[b]
-                                let dx = pa.x - pb.x, dy = pa.y - pb.y
-                                if dx * dx + dy * dy > touchSq { continue }
-                                let dz = p[a].z - pb.z
-                                let adz = abs(dz)
-                                if adz >= sep { continue }
-                                // Neither is lifted: flat rug resting on itself is impossible; skip.
-                                if p[a].z <= floorZ + 0.01 && pb.z <= floorZ + 0.01 { continue }
-                                let push = sep - adz
-                                let wa = invMass[a], wb = invMass[b]
-                                let wsum = wa + wb
-                                if wsum == 0 { continue }
-                                let upper = dz >= 0 ? a : b
-                                let lower = dz >= 0 ? b : a
-                                let wu = invMass[upper] / wsum, wl = invMass[lower] / wsum
-                                p[upper].z += push * wu
-                                q[upper].z += push * wu
-                                var lz = p[lower].z - push * wl
-                                if lz < floorZ {
-                                    let deficit = floorZ - lz
-                                    lz = floorZ
-                                    p[upper].z += deficit * (wu > 0 ? 1 : 0)
-                                    q[upper].z += deficit * (wu > 0 ? 1 : 0)
-                                }
-                                q[lower].z += lz - p[lower].z
-                                p[lower].z = lz
-                            }
-                        }
+        let maxStep: Float = 1.0
+        for k in 0..<n { stackDelta[k] = 0; stackCount[k] = 0; stackDrag[k] = .zero }
+        let mu = layerFriction
+        var any = false
+        for a in 0..<n {
+            let pa = p[a]
+            let ia = a % cols, ja = a / cols
+            let (cx, cy) = cellOf(pa)
+            for oy in -1...1 {
+                let yy = cy + oy
+                if yy < 0 || yy >= ny { continue }
+                for ox in -1...1 {
+                    let xx = cx + ox
+                    if xx < 0 || xx >= nx { continue }
+                    var b = Int(cellHead[yy * nx + xx])
+                    while b >= 0 {
+                        defer { b = Int(cellNext[b]) }
+                        if b <= a { continue }
+                        let ib = b % cols, jb = b / cols
+                        if abs(ia - ib) <= 2 && abs(ja - jb) <= 2 { continue }
+                        let pb = p[b]
+                        let dx = pa.x - pb.x, dy = pa.y - pb.y
+                        if dx * dx + dy * dy > touchSq { continue }
+                        let dz = pa.z - pb.z
+                        let adz = abs(dz)
+                        if adz >= sep { continue }
+                        if pa.z <= floorZ + 0.01 && pb.z <= floorZ + 0.01 { continue }
+                        let wa = w[a], wb = w[b]
+                        let wsum = wa + wb
+                        if wsum == 0 { continue }
+                        let push = sep - adz
+                        let upper = dz >= 0 ? a : b
+                        let lower = dz >= 0 ? b : a
+                        stackDelta[upper] += push * w[upper] / wsum
+                        stackDelta[lower] -= push * w[lower] / wsum
+                        stackCount[upper] += 1
+                        stackCount[lower] += 1
+                        // Friction: pull the two layers' tangential motion toward each other.
+                        let va = SIMD2(p[a].x - q[a].x, p[a].y - q[a].y)
+                        let vb = SIMD2(p[b].x - q[b].x, p[b].y - q[b].y)
+                        let rel = (va - vb) * mu
+                        stackDrag[a] -= rel * (wa / wsum)
+                        stackDrag[b] += rel * (wb / wsum)
+                        any = true
                     }
                 }
             }
         }
+        guard any else { return }
+        // Jacobi update: average the requested corrections and take at most half a layer per substep,
+        // so a crumple with many overlapping layers converges instead of exploding.
+        for k in 0..<n where stackCount[k] > 0 {
+            let c = Float(stackCount[k])
+            var dz = stackDelta[k] / c * stackRelaxation
+            dz = min(max(dz, -maxStep), maxStep)
+            var z = p[k].z + dz
+            if z < floorZ { z = floorZ }
+            p[k].z = z
+            // Contact: no vertical velocity carried into the next substep.
+            q[k].z = z
+            let drag = stackDrag[k] / c
+            p[k].x += drag.x
+            p[k].y += drag.y
+        }
+    }
+
+    /// Debug: the particles that moved most in the last substep, with grid coords and height.
+    func topMovers(_ n: Int) -> [(index: Int, i: Int, j: Int, pos: SIMD3<Float>, move: Float)] {
+        var all: [(Int, Float)] = []
+        all.reserveCapacity(count)
+        for k in 0..<count { all.append((k, simd_length(pos[k] - prev[k]))) }
+        all.sort { $0.1 > $1.1 }
+        return all.prefix(n).map { (k, m) in (k, k % cols, k / cols, pos[k], m) }
     }
 
     /// Smooth per-vertex normals via central differences across the grid.

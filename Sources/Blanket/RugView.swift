@@ -411,6 +411,15 @@ final class RugView: SCNView, SCNSceneRendererDelegate {
     // MARK: - Programmatic interaction (debug / tests)
 
     var debugIsAsleep: Bool { rug.sim.isAsleep }
+    var debugMaxMove: Float { rug.sim.lastMaxMove }
+    func debugTopMovers(_ n: Int) -> String {
+        let sim = rug.sim
+        let b = sim.bounds.map { "fence x<\($0.max.x) y<\($0.max.y)" } ?? "no fence"
+        let rows = sim.topMovers(n).map { m in
+            String(format: "  #%d (i=%d,j=%d) pos=(%.1f, %.1f, %.1f) move=%.2f", m.index, m.i, m.j, m.pos.x, m.pos.y, m.pos.z, m.move)
+        }
+        return ([b] + rows).joined(separator: "\n")
+    }
 
     /// Last published position of the particle at grid coordinates (i, j).
     func debugParticlePosition(i: Int, j: Int) -> SIMD3<Float> {

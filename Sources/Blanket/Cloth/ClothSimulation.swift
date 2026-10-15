@@ -72,6 +72,9 @@ final class ClothSimulation {
     /// Fraction of the required stacking separation applied per pass (relaxation).
     var stackRelaxation: Float = 0.5
     var layerSeparation: Float { thickness * 1.5 }
+    /// Every particle carries a collision sphere of this diameter (in grid spacings). At 1.0 the
+    /// spheres of a sheet overlap enough that nothing, points or edges, can thread between them.
+    var contactDiameter: Float = 1.0
     /// Particles are kept inside this XY rectangle so the rug can never be dragged out of reach.
     var bounds: (min: SIMD2<Float>, max: SIMD2<Float>)?
 
@@ -83,11 +86,10 @@ final class ClothSimulation {
     // Spatial hash and accumulation scratch space for layer stacking
     private var cellHead: [Int32] = []
     private var cellNext: [Int32]
-    private var stackDelta: [Float]
+    private var stackDelta: [SIMD3<Float>]
     private var stackCount: [Int32]
-    private var stackDrag: [SIMD2<Float>]
-    private var quadStamp: [Int32]
-    private var stampValue: Int32 = 0
+    private var stackNormal: [SIMD3<Float>]
+    private var stackOtherVel: [SIMD3<Float>]
     /// Particles that had a distant neighbour on the first substep of the frame; only these are
     /// probed on the remaining substeps (positions move far less than a cell within one frame).
     private var probe: [Bool]
@@ -109,10 +111,10 @@ final class ClothSimulation {
         prev = Array(repeating: .zero, count: n)
         invMass = Array(repeating: 1, count: n)
         cellNext = Array(repeating: -1, count: n)
-        stackDelta = Array(repeating: 0, count: n)
+        stackDelta = Array(repeating: .zero, count: n)
         stackCount = Array(repeating: 0, count: n)
-        stackDrag = Array(repeating: .zero, count: n)
-        quadStamp = Array(repeating: 0, count: max(1, (cols - 1) * (rows - 1)))
+        stackNormal = Array(repeating: .zero, count: n)
+        stackOtherVel = Array(repeating: .zero, count: n)
         probe = Array(repeating: true, count: n)
         buildConstraints()
         reset()
@@ -366,12 +368,11 @@ final class ClothSimulation {
         return true
     }
 
-    /// Self-collision between layers: every particle is kept one rug thickness away from any
-    /// triangle of the cloth that is at least three grid cells away from it. Which side of that
-    /// surface the particle belongs on is remembered from the start of the substep, so a flap that
-    /// falls fast cannot slip through and get held on the wrong side. Proximity is corrected gently;
-    /// an actual penetration is corrected in full. Contacts also kill vertical velocity and apply
-    /// friction between the layers.
+    /// Self-collision: every particle carries a sphere of diameter `contactDiameter` spacings, and
+    /// spheres of particles that are not grid neighbours may not overlap. Because the spheres of
+    /// one sheet overlap each other, neither points nor edges of another sheet can pass through.
+    /// Contacts are inelastic (approaching velocity along the contact normal is removed) and have
+    /// friction, so stacked layers rest on each other and move together.
     private func stackLayers(_ p: UnsafeMutableBufferPointer<SIMD3<Float>>,
                              _ q: UnsafeMutableBufferPointer<SIMD3<Float>>,
                              _ w: UnsafeBufferPointer<Float>, fullScan: Bool) {
@@ -404,28 +405,19 @@ final class ClothSimulation {
             }
         }
         let nx = hashNX, ny = hashNY
-
-        let sep = layerSeparation
-        let ambiguous = sep * 0.25
+        let D = spacing * contactDiameter
+        let D2 = D * D
         let floorZ = thickness
-        let maxStep: Float = 1.0
-        let relax = stackRelaxation
         let mu = layerFriction
-        let qw = cols - 1
-        for k in 0..<n { stackDelta[k] = 0; stackCount[k] = 0; stackDrag[k] = .zero }
+        for k in 0..<n { stackDelta[k] = .zero; stackCount[k] = 0; stackNormal[k] = .zero; stackOtherVel[k] = .zero }
         var any = false
 
         for a in 0..<n {
-            let pa = p[a]
-            // A particle on the desk cannot be above anything; whatever lies over it probes the
-            // contact from its own side.
-            if pa.z <= floorZ + 0.01 { continue }
             if !fullScan && !probe[a] { continue }
+            let wa = w[a]
+            let pa = p[a]
             let ia = a % cols, ja = a / cols
             let (cx, cy) = cellOf(pa)
-            stampValue &+= 1
-            let stamp = stampValue
-            var overFloorLayer = false
             var sawFar = false
             for oy in -1...1 {
                 let yy = cy + oy
@@ -436,123 +428,52 @@ final class ClothSimulation {
                     var b = Int(cellHead[yy * nx + xx])
                     while b >= 0 {
                         defer { b = Int(cellNext[b]) }
+                        if b == a { continue }
                         let ib = b % cols, jb = b / cols
-                        if abs(ia - ib) <= 2 && abs(ja - jb) <= 2 { continue }
+                        if abs(ia - ib) <= 1 && abs(ja - jb) <= 1 { continue }
                         sawFar = true
-                        // Fast path: the other layer is lying flat on the desk here, so the surface
-                        // under `a` is simply the floor layer. No triangle test needed.
-                        if p[b].z <= floorZ + 0.01 {
-                            let dx = pa.x - p[b].x, dy = pa.y - p[b].y
-                            if dx * dx + dy * dy <= cell * cell { overFloorLayer = true }
-                            continue
-                        }
-                        // The quads that have b as a corner.
-                        for qj in max(jb - 1, 0)...min(jb, rows - 2) {
-                            for qi in max(ib - 1, 0)...min(ib, cols - 2) {
-                                let qid = qj * qw + qi
-                                if quadStamp[qid] == stamp { continue }
-                                quadStamp[qid] = stamp
-                                // Every corner must be at least three cells from a.
-                                if ia >= qi - 2 && ia <= qi + 3 && ja >= qj - 2 && ja <= qj + 3 { continue }
-                                let c0 = qj * cols + qi, c1 = c0 + 1, c3 = c0 + cols, c2 = c3 + 1
-                                if contact(a, c0, c1, c2, p, q, w, sep, ambiguous, floorZ, maxStep, relax, mu) { any = true; continue }
-                                if contact(a, c0, c2, c3, p, q, w, sep, ambiguous, floorZ, maxStep, relax, mu) { any = true }
-                            }
-                        }
+                        let d = p[b] - pa
+                        let d2 = simd_length_squared(d)
+                        if d2 >= D2 { continue }
+                        let wb = w[b]
+                        let wsum = wa + wb
+                        if wsum == 0 || wa == 0 { continue }
+                        let dist = d2.squareRoot()
+                        // Degenerate: coincident particles separate vertically.
+                        let nrm = dist > 1e-4 ? d / dist : SIMD3<Float>(0, 0, 1)
+                        let push = (D - dist) * (wa / wsum)
+                        stackDelta[a] -= nrm * push
+                        stackNormal[a] -= nrm
+                        stackOtherVel[a] += p[b] - q[b]
+                        stackCount[a] += 1
+                        any = true
                     }
                 }
             }
             if fullScan { probe[a] = sawFar }
-            if overFloorLayer && w[a] > 0 {
-                let gap = pa.z - floorZ
-                if gap < sep {
-                    let push = gap < sep * 0.5 ? sep - gap : min((sep - gap) * relax, maxStep)
-                    stackDelta[a] += push
-                    stackCount[a] += 1
-                    // Friction against the resting layer below.
-                    stackDrag[a] -= SIMD2(pa.x - q[a].x, pa.y - q[a].y) * mu
-                    any = true
-                }
-            }
         }
         guard any else { return }
-        // Jacobi update: average the requested corrections per particle.
+
+        // Jacobi update: average the corrections, then make the contact inelastic with friction.
         for k in 0..<n where stackCount[k] > 0 {
             let c = Float(stackCount[k])
-            var z = p[k].z + stackDelta[k] / c
-            if z < floorZ { z = floorZ }
-            p[k].z = z
-            // Contact: no vertical velocity carried into the next substep.
-            q[k].z = z
-            let drag = stackDrag[k] / c
-            p[k].x += drag.x
-            p[k].y += drag.y
+            var x = p[k] + stackDelta[k] / c
+            if x.z < floorZ { x.z = floorZ }
+            var v = x - q[k]
+            let nl = simd_length(stackNormal[k])
+            if nl > 1e-6 {
+                let nrm = stackNormal[k] / nl          // points away from the other layer
+                let vOther = stackOtherVel[k] / c
+                var rel = v - vOther
+                let vn = simd_dot(rel, nrm)
+                if vn < 0 { rel -= nrm * vn }          // stop approaching
+                let tangential = rel - nrm * simd_dot(rel, nrm)
+                rel -= tangential * mu                 // friction against the other layer
+                v = vOther + rel
+            }
+            p[k] = x
+            q[k] = x - v
         }
-    }
-
-    /// Point-triangle layer contact for particle `a` against triangle (t0, t1, t2), in XY projection.
-    /// Returns true if `a` lies over the triangle (whether or not a correction was needed).
-    @inline(__always)
-    private func contact(_ a: Int, _ t0: Int, _ t1: Int, _ t2: Int,
-                         _ p: UnsafeMutableBufferPointer<SIMD3<Float>>,
-                         _ q: UnsafeMutableBufferPointer<SIMD3<Float>>,
-                         _ w: UnsafeBufferPointer<Float>,
-                         _ sep: Float, _ ambiguous: Float, _ floorZ: Float,
-                         _ maxStep: Float, _ relax: Float, _ mu: Float) -> Bool {
-        let pa = p[a]
-        let A = p[t0], B = p[t1], C = p[t2]
-        let v0x = B.x - A.x, v0y = B.y - A.y
-        let v1x = C.x - A.x, v1y = C.y - A.y
-        let v2x = pa.x - A.x, v2y = pa.y - A.y
-        let d00 = v0x * v0x + v0y * v0y, d01 = v0x * v1x + v0y * v1y, d11 = v1x * v1x + v1y * v1y
-        let d20 = v2x * v0x + v2y * v0y, d21 = v2x * v1x + v2y * v1y
-        let denom = d00 * d11 - d01 * d01
-        if abs(denom) < 1e-6 { return false }
-        let b1 = (d11 * d20 - d01 * d21) / denom
-        let b2 = (d00 * d21 - d01 * d20) / denom
-        let b0 = 1 - b1 - b2
-        let eps: Float = -0.02
-        if b0 < eps || b1 < eps || b2 < eps { return false }
-
-        let zs = b0 * A.z + b1 * B.z + b2 * C.z
-        let zsPrev = b0 * q[t0].z + b1 * q[t1].z + b2 * q[t2].z
-        let dzPrev = q[a].z - zsPrev
-        let dzNow = pa.z - zs
-        let above: Bool
-        if abs(dzPrev) >= ambiguous { above = dzPrev > 0 }
-        else if abs(dzNow) >= ambiguous { above = dzNow > 0 }
-        else { above = a > t0 }   // deterministic: the later part of the grid folds over the earlier
-        let signed = above ? dzNow : -dzNow
-        if signed >= sep { return true }
-
-        var push = sep - signed
-        if signed >= 0 {
-            // Close but on the right side: ease apart.
-            push = min(push * relax, maxStep)
-        }
-        let wa = w[a]
-        let wt = b0 * b0 * w[t0] + b1 * b1 * w[t1] + b2 * b2 * w[t2]
-        let denomW = wa + wt
-        if denomW == 0 { return true }
-        let lambda = push / denomW
-        let dir: Float = above ? 1 : -1
-        stackDelta[a] += dir * lambda * wa
-        stackCount[a] += 1
-        stackDelta[t0] -= dir * lambda * w[t0] * b0
-        stackDelta[t1] -= dir * lambda * w[t1] * b1
-        stackDelta[t2] -= dir * lambda * w[t2] * b2
-        stackCount[t0] += 1; stackCount[t1] += 1; stackCount[t2] += 1
-
-        // Friction between the particle and the surface it rests on.
-        let va = SIMD2(pa.x - q[a].x, pa.y - q[a].y)
-        let vt = SIMD2(b0 * (A.x - q[t0].x) + b1 * (B.x - q[t1].x) + b2 * (C.x - q[t2].x),
-                       b0 * (A.y - q[t0].y) + b1 * (B.y - q[t1].y) + b2 * (C.y - q[t2].y))
-        let rel = (va - vt) * mu
-        stackDrag[a] -= rel * (wa / denomW)
-        stackDrag[t0] += rel * (w[t0] * b0 / denomW)
-        stackDrag[t1] += rel * (w[t1] * b1 / denomW)
-        stackDrag[t2] += rel * (w[t2] * b2 / denomW)
-        return true
     }
 
     /// Debug metric: particles closer than half a layer to (or inside) a distant part of the cloth.

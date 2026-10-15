@@ -50,10 +50,10 @@ launches.
 - `ClothSimulation` is a position-based-dynamics cloth with structural, shear,
   bend and long-range constraints, lying on the z = 0 plane with gravity, floor
   collision and friction. Constraints resist stretching fully and compression
-  weakly, so the rug buckles instead of fighting itself. Layer contact keeps
-  every particle one rug thickness away from any distant triangle of the cloth,
-  remembering which side it belongs on, so a folded flap rests on the base
-  instead of clipping through it. The cloth sleeps when nothing moves, and
+  weakly, so the rug buckles instead of fighting itself. Every particle carries
+  a collision sphere one grid spacing wide; the spheres of a sheet overlap, so
+  no point or edge of another fold can thread through it, and stacked layers
+  rest on each other with friction. The cloth sleeps when nothing moves, and
   rendering pauses with it, so the idle cost is close to zero.
 - `RugView` is a SceneKit view with a transparent background and a mild
   perspective camera looking straight down, placed so the desk plane maps 1:1
@@ -77,9 +77,8 @@ Tuning knobs live at the top of `Sources/Blanket/Cloth/ClothSimulation.swift`
 
 ## Limitations
 
-- Layer contact is vertical only, in the spirit of a rug on a desk. A fold can
-  still slide through another one sideways if you work at it. Nobody has
-  complained.
+- Folded layers sit about one grid spacing apart, so a folded rug is a touch
+  thicker than it should be. It is called Blanket, so this is fine.
 - The underside of a custom image is the same image, faded. Real rugs are less
   photogenic from below too.
 

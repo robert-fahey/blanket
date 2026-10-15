@@ -76,8 +76,32 @@ final class DebugDriver {
         }
         schedule(5.2) { self.snapshot("6-wide-pull") }
         schedule(5.65) { self.view.debugEndGrab(velocity: .zero) }
-        schedule(6.5) {
-            self.snapshot("7-wide-settled")
+        schedule(6.5) { self.snapshot("7-wide-settled") }
+
+        // Double fold: fold the corner all the way over, then fold the new top corner back.
+        schedule(6.6) { self.view.reset() }
+        var c1 = SIMD2<Float>(0, 0), far = SIMD2<Float>(0, 0), centre = SIMD2<Float>(0, 0)
+        schedule(6.9) {
+            let a = self.view.debugParticlePosition(i: grid.cols - 2, j: 1)
+            let b = self.view.debugParticlePosition(i: 1, j: grid.rows - 2)
+            let m = self.view.debugParticlePosition(i: grid.cols / 2, j: grid.rows / 2)
+            c1 = SIMD2(a.x, a.y); far = SIMD2(b.x, b.y); centre = SIMD2(m.x, m.y)
+            self.view.debugBeginGrab(at: c1)
+        }
+        for s in 1...steps {
+            let f = Float(s) / Float(steps)
+            schedule(6.9 + 1.6 * Double(f)) { self.view.debugMoveGrab(to: c1 + (far - c1) * f, speed: 500) }
+        }
+        schedule(8.6) { self.view.debugEndGrab(velocity: .zero) }
+        schedule(9.4) { self.snapshot("8-folded-over") }
+        schedule(9.5) { self.view.debugBeginGrab(at: far) }
+        for s in 1...steps {
+            let f = Float(s) / Float(steps)
+            schedule(9.5 + 1.3 * Double(f)) { self.view.debugMoveGrab(to: far + (centre - far) * f, speed: 500) }
+        }
+        schedule(10.9) { self.view.debugEndGrab(velocity: .zero) }
+        schedule(11.8) {
+            self.snapshot("9-double-fold")
             let n = max(self.view.profileFrames, 1)
             self.log(String(format: "profile: %d active frames, step %.2f ms (solve %.2f, stack %.2f), geometry %.2f ms (avg per frame)",
                             n, self.view.profileStepSeconds / Double(n) * 1000,

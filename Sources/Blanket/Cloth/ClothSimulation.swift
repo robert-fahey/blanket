@@ -192,6 +192,11 @@ final class ClothSimulation {
     /// Load externally saved positions (same grid dimensions required).
     func load(positions: [SIMD3<Float>]) {
         guard positions.count == count else { return }
+        let limit: Float = 20_000
+        for v in positions where !(v.x.isFinite && v.y.isFinite && v.z.isFinite) || abs(v.x) > limit || abs(v.y) > limit || abs(v.z) > limit {
+            NSLog("Blanket: saved rug state is corrupt; laying the rug flat")
+            return
+        }
         pos = positions
         prev = positions
         for k in 0..<count { invMass[k] = 1 }
@@ -327,6 +332,11 @@ final class ClothSimulation {
         if !isGrabbing { keepOnScreen() }
         let move = maxMove.squareRoot()
         lastMaxMove = move
+        if !move.isFinite || move > 2000 || !isSane() {
+            NSLog("Blanket: simulation blew up (move %.1f); laying the rug flat", move)
+            reset()
+            return true
+        }
 
         if !isGrabbing {
             drowsyCount = move < drowsyThreshold ? drowsyCount + 1 : 0
@@ -393,6 +403,8 @@ final class ClothSimulation {
             hashNX = Int((maxX - hashMinX) / cell) + 3
             hashNY = Int((maxY - hashMinY) / cell) + 3
             let cellCount = hashNX * hashNY
+            // A sane rug spans a few hundred cells. Anything bigger means the state is corrupt.
+            if cellCount > 250_000 { return }
             if cellHead.count < cellCount { cellHead = Array(repeating: -1, count: cellCount) }
             for c in 0..<cellCount { cellHead[c] = -1 }
             for k in 0..<n {
@@ -453,11 +465,13 @@ final class ClothSimulation {
         guard any else { return }
 
         // Jacobi update: average the corrections, then make the contact inelastic with friction.
+        // The correction itself is applied to position and history alike, so it never becomes a kick.
         for k in 0..<n where stackCount[k] > 0 {
             let c = Float(stackCount[k])
-            var x = p[k] + stackDelta[k] / c
+            let xOld = p[k]
+            var x = xOld + stackDelta[k] / c
             if x.z < floorZ { x.z = floorZ }
-            var v = x - q[k]
+            var v = xOld - q[k]
             let nl = simd_length(stackNormal[k])
             if nl > 1e-6 {
                 let nrm = stackNormal[k] / nl          // points away from the other layer
@@ -514,6 +528,15 @@ final class ClothSimulation {
         return count
     }
 
+    /// Every position finite and within a generous distance of the screen.
+    func isSane() -> Bool {
+        let limit: Float = 50_000
+        for v in pos where !(v.x.isFinite && v.y.isFinite && v.z.isFinite) || abs(v.x) > limit || abs(v.y) > limit || abs(v.z) > limit {
+            return false
+        }
+        return true
+    }
+
     /// Rigidly shift the whole rug back if less than `fence` points of it remain on screen.
     private func keepOnScreen() {
         guard let b = bounds else { return }
@@ -525,7 +548,7 @@ final class ClothSimulation {
         if lo.x > b.max.x - fence { shift.x = b.max.x - fence - lo.x }
         if hi.y < b.min.y + fence { shift.y = b.min.y + fence - hi.y }
         if lo.y > b.max.y - fence { shift.y = b.max.y - fence - lo.y }
-        guard shift != .zero else { return }
+        guard shift != .zero, shift.x.isFinite, shift.y.isFinite else { return }
         let d = SIMD3<Float>(shift.x, shift.y, 0)
         for k in 0..<count { pos[k] += d; prev[k] += d }
     }
